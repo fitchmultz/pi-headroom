@@ -17,13 +17,11 @@ The cut is implemented through pi's `context` hook, so it's non-destructive: the
 
 ## Load
 
-Not published; load the file directly:
-
 ```bash
-pi -e /path/to/pi-headroom/index.ts
+pi install git:github.com/fitchmultz/pi-headroom
 ```
 
-Or add the absolute path to `extensions` in `~/.pi/agent/settings.json` / `<project>/.pi/settings.json` to load it automatically.
+Or load the file directly: `pi -e /path/to/pi-headroom/index.ts`.
 
 ## Develop
 

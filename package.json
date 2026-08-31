@@ -1,9 +1,17 @@
 {
 	"name": "pi-headroom",
-	"version": "0.1.0",
+	"version": "0.1.2",
 	"private": true,
 	"type": "module",
 	"description": "Model-managed context windows for pi: live token meter, new_context cutover tool, persistent notes, transcript history search.",
+	"keywords": ["pi-package", "pi", "context", "headroom"],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/fitchmultz/pi-headroom.git"
+	},
+	"pi": {
+		"extensions": ["./index.ts"]
+	},
 	"scripts": {
 		"check": "tsc --noEmit"
 	},
