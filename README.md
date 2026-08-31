@@ -30,6 +30,10 @@ npm install
 npm run check   # tsc --noEmit
 ```
 
+## Prompt caching
+
+Cache-safe by construction: the meter is a context-only tail message (never persisted), and the guidance append is a constant string inside the cached system-prompt prefix. Measured on a 3-turn probe: 28k-token prefix written once, `cacheRead=28041` on every later request. A `new_context` cut invalidates the prefix once, by design, and the fresh window is small and re-caches immediately.
+
 ## Known ceilings
 
 - **Cut state is per-process.** Resuming a session in a new process starts with full history again; the model can re-call `new_context` any time, and the meter notice tells it the tools exist. Persisting window boundaries across restarts is possible (custom session entries) but deliberately not built.
