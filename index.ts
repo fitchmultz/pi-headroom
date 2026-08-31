@@ -53,6 +53,7 @@ function flattenEntry(e: any): string | null {
 }
 
 function sessionFiles(dir: string): string[] {
+	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
 		.filter((f) => f.endsWith(".jsonl") && !f.includes(".intent."))
 		.map((f) => join(dir, f));
@@ -78,7 +79,8 @@ export default function (pi: ExtensionAPI) {
 						notice =
 							" Started a new context window — earlier conversation dropped from context (still on disk; use the history tool). Notes persist in .pi/notes/.";
 					} else {
-						cutActive = false; // nothing left to cut; window is fresh
+						cutActive = false;
+						notice = " Already in a fresh window — nothing was cut.";
 					}
 					break;
 				}
