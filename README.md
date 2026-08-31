@@ -2,6 +2,8 @@
 
 Model-managed context windows for [pi](https://github.com/earendil-works/pi-mono): the model sees how much context it has left and decides when to start a fresh window — with hard cutovers instead of lossy compaction summaries.
 
+![pi-headroom flow](diagram.png)
+
 Same idea as Codex's token-budget flow ([openai/codex#27488](https://github.com/openai/codex/pull/27488), [openai/codex#39827](https://github.com/openai/codex/pull/39827)), but local-only and non-destructive.
 
 ## How it works

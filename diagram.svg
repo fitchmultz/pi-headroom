@@ -1,0 +1,157 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="t d">
+  <title id="t">pi-headroom flow</title>
+  <desc id="d">The model sees a live context meter, saves notes, calls new_context for a hard cutover, and recovers dropped conversation from the on-disk transcript and notes.</desc>
+
+  <style>
+    .sans { font-family: Inter, ui-sans-serif, Arial, sans-serif; }
+    .mono { font-family: "JetBrains Mono", ui-monospace, monospace; }
+    .title { font-size: 46px; font-weight: 700; fill: #F8FAFC; letter-spacing: -1px; }
+    .subtitle { font-size: 17px; fill: #91A0B8; }
+    .eyebrow { font-size: 12px; fill: #7488A3; letter-spacing: 3px; }
+    .cardtitle { font-size: 20px; font-weight: 700; fill: #F8FAFC; }
+    .cardbody { font-size: 15px; fill: #B7C1D4; }
+    .cardtitle-inv { font-size: 20px; font-weight: 700; fill: #FFFFFF; }
+    .cardbody-inv { font-size: 15px; fill: #E0E7FF; }
+    .num { font-size: 13px; font-weight: 700; fill: #E2E8F0; text-anchor: middle; }
+    .num-inv { font-size: 13px; font-weight: 700; fill: #4F46E5; text-anchor: middle; }
+    .chip { font-size: 10.5px; letter-spacing: 1.5px; text-anchor: middle; }
+    .storename { font-size: 14px; font-weight: 700; fill: #F8FAFC; }
+    .storebody { font-size: 13.5px; fill: #91A0B8; }
+    .lane { font-size: 11px; fill: #7488A3; letter-spacing: 1.5px; }
+    .footer { font-size: 11.5px; fill: #7488A3; text-anchor: middle; }
+  </style>
+
+  <defs>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="1.2" cy="1.2" r="1.2" fill="#22304A"/>
+    </pattern>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="14" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 Z" fill="#7C8DA6"/>
+    </marker>
+    <marker id="arr-amber" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 Z" fill="#F59E0B"/>
+    </marker>
+    <marker id="arr-indigo" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 1 L 8 5 L 0 9 Z" fill="#818CF8"/>
+    </marker>
+  </defs>
+
+  <!-- canvas -->
+  <rect width="1600" height="900" fill="#0B1120"/>
+  <rect width="1600" height="900" fill="url(#dots)"/>
+
+  <!-- title block -->
+  <text class="mono eyebrow" x="72" y="92">PI EXTENSION — CONTEXT SELF-MANAGEMENT</text>
+  <text class="sans title" x="72" y="142">pi-headroom</text>
+  <text class="sans subtitle" x="72" y="178">The model sees its remaining context and decides when to start a fresh window — hard cutover, no lossy summary.</text>
+
+  <!-- on-disk zone -->
+  <rect x="724" y="636" width="744" height="136" rx="16" fill="#0E1525" stroke="#334155" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text class="mono lane" x="748" y="762">ON DISK · SURVIVES RESETS</text>
+
+  <!-- connectors (behind cards) -->
+  <path d="M 1416 296 L 1416 240 Q 1416 222 1392 222 L 232 222 Q 200 222 200 244 L 200 296" fill="none" stroke="#7C8DA6" stroke-width="2.5" marker-end="url(#arr)"/>
+  <rect x="673" y="206" width="270" height="32" rx="16" fill="#131D33" stroke="#334155" stroke-width="1.5"/>
+  <text class="mono lane" x="808" y="227" text-anchor="middle">CONTINUE IN THE FRESH WINDOW</text>
+
+  <line x1="334" y1="410" x2="368" y2="410" stroke="#7C8DA6" stroke-width="3" marker-end="url(#arr)"/>
+  <line x1="638" y1="410" x2="672" y2="410" stroke="#7C8DA6" stroke-width="3" marker-end="url(#arr)"/>
+  <line x1="942" y1="410" x2="976" y2="410" stroke="#7C8DA6" stroke-width="3" marker-end="url(#arr)"/>
+  <line x1="1246" y1="410" x2="1280" y2="410" stroke="#7C8DA6" stroke-width="3" marker-end="url(#arr)"/>
+
+  <line x1="808" y1="524" x2="808" y2="664" stroke="#F59E0B" stroke-width="2.5" marker-end="url(#arr-amber)"/>
+  <text class="mono lane" x="822" y="592">WRITE</text>
+  <line x1="1112" y1="524" x2="1112" y2="664" stroke="#F59E0B" stroke-width="2.5" marker-end="url(#arr-amber)"/>
+  <text class="mono lane" x="1126" y="592">KEPT INTACT</text>
+  <line x1="1400" y1="632" x2="1400" y2="528" stroke="#818CF8" stroke-width="2.5" marker-end="url(#arr-indigo)"/>
+  <text class="mono lane" x="1414" y="592">READ ON DEMAND</text>
+
+  <!-- stage 1: meter -->
+  <g>
+    <rect x="72" y="300" width="256" height="220" rx="16" fill="#131D33" stroke="#243049" stroke-width="1.5" filter="url(#soft)"/>
+    <circle cx="104" cy="334" r="15" fill="#3B4A63"/>
+    <text class="mono num" x="104" y="339">1</text>
+    <text class="sans cardtitle" x="128" y="341">Meter</text>
+    <text class="sans cardbody" x="96" y="390">Every LLM request gets a</text>
+    <text class="sans cardbody" x="96" y="411">[headroom] tail message</text>
+    <text class="sans cardbody" x="96" y="432">with live token usage.</text>
+    <rect x="96" y="472" width="122" height="26" rx="13" fill="#1E293B"/>
+    <text class="mono chip" x="157" y="489" fill="#91A0B8">CONTEXT HOOK</text>
+  </g>
+
+  <!-- stage 2: decide -->
+  <g>
+    <rect x="376" y="300" width="256" height="220" rx="16" fill="#131D33" stroke="#243049" stroke-width="1.5" filter="url(#soft)"/>
+    <circle cx="408" cy="334" r="15" fill="#3B4A63"/>
+    <text class="mono num" x="408" y="339">2</text>
+    <text class="sans cardtitle" x="432" y="341">Decide</text>
+    <text class="sans cardbody" x="400" y="390">The model watches its own</text>
+    <text class="sans cardbody" x="400" y="411">remaining window. Full, or</text>
+    <text class="sans cardbody" x="400" y="432">no longer useful?</text>
+    <rect x="400" y="472" width="122" height="26" rx="13" fill="#1E293B"/>
+    <text class="mono chip" x="461" y="489" fill="#91A0B8">MODEL POLICY</text>
+  </g>
+
+  <!-- stage 3: save -->
+  <g>
+    <rect x="680" y="300" width="256" height="220" rx="16" fill="#131D33" stroke="#243049" stroke-width="1.5" filter="url(#soft)"/>
+    <circle cx="712" cy="334" r="15" fill="#F59E0B"/>
+    <text class="mono num" x="712" y="339" fill="#0B1120">3</text>
+    <text class="sans cardtitle" x="736" y="341">Save</text>
+    <text class="sans cardbody" x="704" y="390">Save goal, progress,</text>
+    <text class="sans cardbody" x="704" y="411">decisions and next steps</text>
+    <text class="sans cardbody" x="704" y="432">before leaving.</text>
+    <rect x="704" y="472" width="108" height="26" rx="13" fill="#3A2A10"/>
+    <text class="mono chip" x="758" y="489" fill="#F59E0B">NOTES TOOL</text>
+  </g>
+
+  <!-- stage 4: cut over (primary) -->
+  <g>
+    <rect x="984" y="300" width="256" height="220" rx="16" fill="#4F46E5" filter="url(#soft)"/>
+    <circle cx="1016" cy="334" r="15" fill="#FFFFFF"/>
+    <text class="mono num-inv" x="1016" y="339">4</text>
+    <text class="sans cardtitle-inv" x="1040" y="341">Cut over</text>
+    <text class="sans cardbody-inv" x="1008" y="390">new_context: the next</text>
+    <text class="sans cardbody-inv" x="1008" y="411">request keeps only the</text>
+    <text class="sans cardbody-inv" x="1008" y="432">current turn. No summary.</text>
+    <rect x="1008" y="472" width="116" height="26" rx="13" fill="#FFFFFF"/>
+    <text class="mono chip" x="1066" y="489" fill="#4F46E5">NEW_CONTEXT</text>
+  </g>
+
+  <!-- stage 5: recover -->
+  <g>
+    <rect x="1288" y="300" width="256" height="220" rx="16" fill="#131D33" stroke="#243049" stroke-width="1.5" filter="url(#soft)"/>
+    <circle cx="1320" cy="334" r="15" fill="#3B4A63"/>
+    <text class="mono num" x="1320" y="339">5</text>
+    <text class="sans cardtitle" x="1344" y="341">Recover</text>
+    <text class="sans cardbody" x="1312" y="390">Search the dropped</text>
+    <text class="sans cardbody" x="1312" y="411">conversation and reload</text>
+    <text class="sans cardbody" x="1312" y="432">notes on demand.</text>
+    <rect x="1312" y="472" width="116" height="26" rx="13" fill="#1E293B"/>
+    <text class="mono chip" x="1370" y="489" fill="#91A0B8">HISTORY TOOL</text>
+  </g>
+
+  <!-- store: notes -->
+  <g>
+    <rect x="756" y="676" width="300" height="68" rx="12" fill="#131D33" stroke="#F59E0B" stroke-opacity="0.4" stroke-width="1.5"/>
+    <ellipse cx="786" cy="696" rx="12" ry="5" fill="none" stroke="#F59E0B" stroke-width="2"/>
+    <path d="M 774 696 L 774 716 A 12 5 0 0 0 798 716 L 798 696" fill="none" stroke="#F59E0B" stroke-width="2"/>
+    <text class="mono storename" x="812" y="700">.pi/notes/</text>
+    <text class="sans storebody" x="812" y="722">durable state, written before the cut</text>
+  </g>
+
+  <!-- store: session transcript -->
+  <g>
+    <rect x="1092" y="676" width="344" height="68" rx="12" fill="#131D33" stroke="#F59E0B" stroke-opacity="0.4" stroke-width="1.5"/>
+    <ellipse cx="1122" cy="696" rx="12" ry="5" fill="none" stroke="#F59E0B" stroke-width="2"/>
+    <path d="M 1110 696 L 1110 716 A 12 5 0 0 0 1134 716 L 1134 696" fill="none" stroke="#F59E0B" stroke-width="2"/>
+    <text class="mono storename" x="1148" y="700">session JSONL</text>
+    <text class="sans storebody" x="1148" y="722">full transcript — cuts never truncate it</text>
+  </g>
+
+  <!-- footer -->
+  <text class="mono footer" x="800" y="872">FALLBACK IF THE MODEL NEVER RESETS: PI AUTO-COMPACTION (BUILT-IN, UNCHANGED) · CACHE-SAFE TAIL INJECTION — MEASURED CACHE READ 28,041 / 28,097 TOKENS ON LATER TURNS</text>
+</svg>
