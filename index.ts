@@ -14,17 +14,42 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
 import { Type } from "typebox";
-import { type ExtensionAPI, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, getAgentDir, SettingsManager, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
 const MARK = "[headroom]";
 
-const GUIDANCE = `## Context self-management (pi-headroom)
-A [headroom] message shows live context usage. When the window nears full or stops being useful:
-1. Save durable state with the notes tool (.pi/notes/ survives context resets): goal, progress, decisions, next steps.
-2. Call new_context. No summary is generated — earlier conversation leaves context but stays on disk.
-3. Recover dropped conversation with the history tool; reload saved state with the notes tool.
-Never guess about content that left the window — check notes/history instead of answering from memory.
-If you never reset, automatic compaction remains the fallback.`;
+/**
+ * Guidance is computed from the user's real compaction settings: the model's
+ * cut decisions are anchored to the actual auto-compaction deadline, not an
+ * assumed one. Re-resolved per agent run so mid-session settings changes apply.
+ */
+function buildGuidance(cwd: string, contextWindow: number | undefined): string {
+	let enabled = true;
+	let reserveTokens = 16384;
+	try {
+		const s = SettingsManager.create(cwd, getAgentDir()).getCompactionSettings();
+		enabled = s.enabled;
+		reserveTokens = s.reserveTokens;
+	} catch {
+		// defaults already set
+	}
+	let deadline: string;
+	if (!enabled) {
+		deadline =
+			"Auto-compaction is DISABLED in the user's settings. You must manage the window yourself: save notes and call new_context before it fills, or the turn fails on overflow.";
+	} else if (contextWindow) {
+		const pct = Math.max(1, Math.round(((contextWindow - reserveTokens) / contextWindow) * 100));
+		deadline = `If you never reset, auto-compaction fires at ~${pct}% (reserveTokens=${reserveTokens.toLocaleString("en-US")}). For a clean transition, save notes and call new_context before that line.`;
+	} else {
+		deadline =
+			"If you never reset, auto-compaction fires near the end of the window. For a clean transition, save notes and call new_context before it fills.";
+	}
+	return `## Context self-management (pi-headroom)
+A [headroom] message before each response shows live context usage. It is routine telemetry, not a warning — below the compaction line it needs no action.
+${deadline}
+When you do reset: 1) save durable state with the notes tool (.pi/notes/ survives resets): goal, progress, decisions, next steps. 2) Call new_context. No summary is generated — earlier conversation leaves context but stays on disk. 3) Recover dropped conversation with the history tool; reload saved state with the notes tool.
+Never guess about content that left the window — check notes/history instead of answering from memory.`;
+}
 
 type AnyMsg = { role: string; content?: unknown };
 
@@ -64,8 +89,8 @@ export default function (pi: ExtensionAPI) {
 	// user message). Sticky until the window is fresh (nothing left to cut).
 	let cutActive = false;
 
-	pi.on("before_agent_start", (event) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${GUIDANCE}`,
+	pi.on("before_agent_start", (event, ctx) => ({
+		systemPrompt: `${event.systemPrompt}\n\n${buildGuidance(ctx.cwd, ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow)}`,
 	}));
 
 	pi.on("context", (event, ctx) => {

@@ -13,7 +13,7 @@ Same idea as Codex's token-budget flow ([openai/codex#27488](https://github.com/
 3. **`notes` tool** — persistent notes in `.pi/notes/` that survive resets (`list` / `read` / `write` / `append` / `search`). The model is instructed to save state *before* cutting over.
 4. **`history` tool** — searches/reads the session transcript on disk (`search` / `read`), so dropped conversation is recoverable on demand.
 
-The cut is implemented through pi's `context` hook, so it's non-destructive: the session JSONL keeps the full transcript. Auto-compaction stays enabled as the fallback if the model never resets.
+The cut is implemented through pi's `context` hook, so it's non-destructive: the session JSONL keeps the full transcript. Auto-compaction stays enabled as the fallback if the model never resets — and the guidance anchors "nearly full" to your real compaction settings (e.g. `reserveTokens: 64000` on a 400k window → "auto-compaction fires at ~84%"); if compaction is disabled, the model is told it must manage the window itself.
 
 ## Load
 
