@@ -84,10 +84,36 @@ function sessionFiles(dir: string): string[] {
 		.map((f) => join(dir, f));
 }
 
+const CUT_TYPE = "headroom-cut";
+
+function lastUserEntryId(ctx: { sessionManager: { getBranch(): any[] } }): string | undefined {
+	const branch = ctx.sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const e = branch[i];
+		if (e?.type === "message" && e.message?.role === "user" && !textOf(e.message).startsWith(MARK)) return e.id;
+	}
+}
+
+function latestCutId(ctx: { sessionManager: { getBranch(): any[] } }): string | undefined {
+	const branch = ctx.sessionManager.getBranch();
+	for (let i = branch.length - 1; i >= 0; i--) {
+		const e = branch[i];
+		if (e?.type === "custom" && e.customType === CUT_TYPE) {
+			const id = e.data?.firstKeptEntryId;
+			if (typeof id === "string") return id;
+		}
+	}
+}
+
 export default function (pi: ExtensionAPI) {
-	// When true, every LLM request sees only the current turn (from the last real
-	// user message). Sticky until the window is fresh (nothing left to cut).
-	let cutActive = false;
+	// Session-persisted cut: slice from this entry's user message onward.
+	let firstKeptEntryId: string | undefined;
+
+	const restoreCut = (_event: unknown, ctx: { sessionManager: { getBranch(): any[] } }) => {
+		firstKeptEntryId = latestCutId(ctx);
+	};
+	pi.on("session_start", restoreCut);
+	pi.on("session_tree", restoreCut);
 
 	pi.on("before_agent_start", (event, ctx) => ({
 		systemPrompt: `${event.systemPrompt}\n\n${buildGuidance(ctx.cwd, ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow)}`,
@@ -96,19 +122,18 @@ export default function (pi: ExtensionAPI) {
 	pi.on("context", (event, ctx) => {
 		let messages = event.messages;
 		let notice = "";
-		if (cutActive) {
-			for (let i = messages.length - 1; i >= 0; i--) {
-				if (messages[i].role === "user" && !textOf(messages[i]).startsWith(MARK)) {
-					if (i > 0) {
-						messages = messages.slice(i);
-						notice =
-							" Started a new context window — earlier conversation dropped from context (still on disk; use the history tool). Notes persist in .pi/notes/.";
-					} else {
-						cutActive = false;
-						notice = " Already in a fresh window — nothing was cut.";
-					}
-					break;
-				}
+		const cutId = firstKeptEntryId ?? latestCutId(ctx);
+		if (cutId) {
+			firstKeptEntryId = cutId;
+			const kept = ctx.sessionManager.getEntry(cutId);
+			const ts = kept?.type === "message" ? kept.message?.timestamp : undefined;
+			const i = ts == null ? -1 : messages.findIndex((m) => m.timestamp === ts);
+			if (i > 0) {
+				messages = messages.slice(i);
+				notice =
+					" Started a new context window — earlier conversation dropped from context (still on disk; use the history tool). Notes persist in .pi/notes/.";
+			} else if (i === 0) {
+				notice = " Already in a fresh window — nothing was cut.";
 			}
 		}
 		const u = ctx.getContextUsage();
@@ -129,8 +154,13 @@ export default function (pi: ExtensionAPI) {
 			"Always write durable state (goal, progress, decisions, next steps) with the notes tool before calling new_context — new_context does not summarize",
 		],
 		parameters: Type.Object({}),
-		async execute() {
-			cutActive = true;
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const id = lastUserEntryId(ctx);
+			if (!id) {
+				return textResult("Already in a fresh window — nothing was cut.");
+			}
+			firstKeptEntryId = id;
+			pi.appendEntry(CUT_TYPE, { firstKeptEntryId: id });
 			return textResult(
 				"New context window starts on the next request. Earlier conversation is out of context but searchable with the history tool; notes persist in .pi/notes/.",
 			);

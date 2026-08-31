@@ -38,7 +38,7 @@ Cache-safe by construction: the meter is a context-only tail message (never pers
 
 ## Known ceilings
 
-- **Cut state is per-process.** Resuming a session in a new process starts with full history again; the model can re-call `new_context` any time, and the meter notice tells it the tools exist. Persisting window boundaries across restarts is possible (custom session entries) but deliberately not built.
+- **Cut is a session custom entry** (`headroom-cut` / `firstKeptEntryId`). Resume and new processes honor it. The transcript on disk is still complete; only the LLM request is sliced.
 - **First-request meter reads low.** `getContextUsage()` is usage-backed, so the very first request of a session (before any response) shows a near-zero estimate. It self-corrects after the first response.
 - **Notes live in the project** (`.pi/notes/`). Add it to `.gitignore` if you don't want notes committed.
 - History search is substring grep over JSONL, not semantic search. It's enough.
