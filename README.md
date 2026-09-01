@@ -1,42 +1,51 @@
 # pi-headroom
 
-Model-managed context windows for [pi](https://github.com/earendil-works/pi-mono): the model sees how much context it has left and decides when to start a fresh window — with hard cutovers instead of lossy compaction summaries.
+Native, model-managed context windows for a personal patched [Pi](https://github.com/earendil-works/pi): hard cutovers without lossy compaction summaries.
 
 ![pi-headroom flow](diagram.png)
 
-Same idea as Codex's token-budget flow ([openai/codex#27488](https://github.com/openai/codex/pull/27488), [openai/codex#39827](https://github.com/openai/codex/pull/39827)), but local-only and non-destructive.
+The model gets stable window guidance, one near-limit checkpoint reminder, and an on-demand budget tool. A rollover removes the old window from active model context while preserving the complete session transcript.
+
+## Requirement
+
+This version requires the [`native-context-windows`](https://github.com/fitchmultz/pi/tree/feature/native-context-windows) Pi patch. The official Pi package does not yet provide the native boundary used here.
+
+Build the patched worktree, then launch its CLI directly with the extension:
+
+```bash
+cd /Users/mitchfultz/Projects/worktrees/pi/native-context-windows
+npm run build
+node packages/coding-agent/dist/bundle/cli.js \
+  -e /Users/mitchfultz/Projects/worktrees/pi-headroom/native-context-windows/index.ts
+```
+
+Do not use bare `pi` for this version: that still resolves to the unchanged official global install.
 
 ## How it works
 
-1. **Meter** — a `[headroom]` message injected before every LLM call shows live usage: `Context 28,478/400,000 tokens (7% used).`
-2. **`new_context` tool** — the model calls it when the window is nearly full or no longer useful. Earlier conversation leaves context immediately. No summary is generated.
-3. **`notes` tool** — persistent notes in `.pi/notes/` that survive resets (`list` / `read` / `write` / `append` / `search`). The model is instructed to save state *before* cutting over.
-4. **`history` tool** — searches/reads the session transcript on disk (`search` / `read`), so dropped conversation is recoverable on demand.
+1. **Stable guidance** — window behavior is part of the system prompt. There is no changing per-request meter to distract the model or churn the prompt.
+2. **Sparse reminder** — one checkpoint message appears before Pi's configured compaction reserve line.
+3. **`get_context_remaining`** — returns an exact native usage reading only when the model needs it.
+4. **`new_context`** — requests an atomic rollover after the complete tool batch. An optional handoff is persisted and becomes the first state in the fresh window.
+5. **Automatic fallback** — Pi's automatic summary-compaction path is converted into the same no-summary rollover.
+6. **`notes` and `history`** — durable project notes and normalized, window-aware transcript recovery remain available after rollover.
 
-The cut is implemented through pi's `context` hook, so it's non-destructive: the session JSONL keeps the full transcript. Auto-compaction stays enabled as the fallback if the model never resets — and the guidance anchors "nearly full" to your real compaction settings (e.g. `reserveTokens: 64000` on a 400k window → "auto-compaction fires at ~84%"); if compaction is disabled, the model is told it must manage the window itself.
+Pi persists a real `context_window` session entry. Session replay, usage accounting, branch navigation, compaction, and provider input all use the same authoritative boundary; the JSONL transcript remains append-only and complete.
 
-## Load
+## Tools
 
-```bash
-pi install git:github.com/fitchmultz/pi-headroom
-```
+- `new_context({ handoff? })`
+- `get_context_remaining()`
+- `notes({ op, ... })`: `list`, `read`, `write`, `append`, `search`
+- `history({ op, ... })`: `search`, `read`; results include native window IDs, and long reads return the next character offset
 
-Or load the file directly: `pi -e /path/to/pi-headroom/index.ts`.
+Notes live in `.pi/notes/`. Add that directory to `.gitignore` when the project should not track them.
 
 ## Develop
 
 ```bash
 npm install
-npm run check   # tsc --noEmit
+npm run check
 ```
 
-## Prompt caching
-
-Cache-safe by construction: the meter is a context-only tail message (never persisted), and the guidance append is a constant string inside the cached system-prompt prefix. Measured on a 3-turn probe: 28k-token prefix written once, `cacheRead=28041` on every later request. A `new_context` cut invalidates the prefix once, by design, and the fresh window is small and re-caches immediately.
-
-## Known ceilings
-
-- **Cut is a session custom entry** (`headroom-cut` / `firstKeptEntryId`). Resume and new processes honor it. The transcript on disk is still complete; only the LLM request is sliced.
-- **First-request meter reads low.** `getContextUsage()` is usage-backed, so the very first request of a session (before any response) shows a near-zero estimate. It self-corrects after the first response.
-- **Notes live in the project** (`.pi/notes/`). Add it to `.gitignore` if you don't want notes committed.
-- History search is substring grep over JSONL, not semantic search. It's enough.
+For end-to-end testing, use the explicit patched CLI command above rather than the official installed binary.

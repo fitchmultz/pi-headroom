@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="t d">
   <title id="t">pi-headroom flow</title>
-  <desc id="d">The model sees a live context meter, saves notes, calls new_context for a hard cutover, and recovers dropped conversation from the on-disk transcript and notes.</desc>
+  <desc id="d">The model gets sparse context-budget signals, saves a handoff or notes, calls new_context for a native hard cutover, and recovers earlier conversation from the on-disk transcript.</desc>
 
   <style>
     .sans { font-family: Inter, ui-sans-serif, Arial, sans-serif; }
@@ -46,7 +46,7 @@
   <!-- title block -->
   <text class="mono eyebrow" x="72" y="92">PI EXTENSION — CONTEXT SELF-MANAGEMENT</text>
   <text class="sans title" x="72" y="142">pi-headroom</text>
-  <text class="sans subtitle" x="72" y="178">The model sees its remaining context and decides when to start a fresh window — hard cutover, no lossy summary.</text>
+  <text class="sans subtitle" x="72" y="178">Sparse budget signals and a native persisted boundary — hard cutover, no lossy summary.</text>
 
   <!-- on-disk zone -->
   <rect x="724" y="636" width="744" height="136" rx="16" fill="#0E1525" stroke="#334155" stroke-width="1.5" stroke-dasharray="6 5"/>
@@ -69,17 +69,17 @@
   <line x1="1400" y1="632" x2="1400" y2="528" stroke="#818CF8" stroke-width="2.5" marker-end="url(#arr-indigo)"/>
   <text class="mono lane" x="1414" y="592">READ ON DEMAND</text>
 
-  <!-- stage 1: meter -->
+  <!-- stage 1: sparse budget signal -->
   <g>
     <rect x="72" y="300" width="256" height="220" rx="16" fill="#131D33" stroke="#243049" stroke-width="1.5" filter="url(#soft)"/>
     <circle cx="104" cy="334" r="15" fill="#3B4A63"/>
     <text class="mono num" x="104" y="339">1</text>
-    <text class="sans cardtitle" x="128" y="341">Meter</text>
-    <text class="sans cardbody" x="96" y="390">Every LLM request gets a</text>
-    <text class="sans cardbody" x="96" y="411">[headroom] tail message</text>
-    <text class="sans cardbody" x="96" y="432">with live token usage.</text>
+    <text class="sans cardtitle" x="128" y="341">Budget</text>
+    <text class="sans cardbody" x="96" y="390">Stable guidance, then one</text>
+    <text class="sans cardbody" x="96" y="411">checkpoint reminder near</text>
+    <text class="sans cardbody" x="96" y="432">the rollover line.</text>
     <rect x="96" y="472" width="122" height="26" rx="13" fill="#1E293B"/>
-    <text class="mono chip" x="157" y="489" fill="#91A0B8">CONTEXT HOOK</text>
+    <text class="mono chip" x="157" y="489" fill="#91A0B8">SPARSE SIGNAL</text>
   </g>
 
   <!-- stage 2: decide -->
@@ -88,9 +88,9 @@
     <circle cx="408" cy="334" r="15" fill="#3B4A63"/>
     <text class="mono num" x="408" y="339">2</text>
     <text class="sans cardtitle" x="432" y="341">Decide</text>
-    <text class="sans cardbody" x="400" y="390">The model watches its own</text>
-    <text class="sans cardbody" x="400" y="411">remaining window. Full, or</text>
-    <text class="sans cardbody" x="400" y="432">no longer useful?</text>
+    <text class="sans cardbody" x="400" y="390">The model checks exact</text>
+    <text class="sans cardbody" x="400" y="411">remaining context only</text>
+    <text class="sans cardbody" x="400" y="432">when the task needs it.</text>
     <rect x="400" y="472" width="122" height="26" rx="13" fill="#1E293B"/>
     <text class="mono chip" x="461" y="489" fill="#91A0B8">MODEL POLICY</text>
   </g>
@@ -101,9 +101,9 @@
     <circle cx="712" cy="334" r="15" fill="#F59E0B"/>
     <text class="mono num" x="712" y="339" fill="#0B1120">3</text>
     <text class="sans cardtitle" x="736" y="341">Save</text>
-    <text class="sans cardbody" x="704" y="390">Save goal, progress,</text>
-    <text class="sans cardbody" x="704" y="411">decisions and next steps</text>
-    <text class="sans cardbody" x="704" y="432">before leaving.</text>
+    <text class="sans cardbody" x="704" y="390">Pass a concise handoff,</text>
+    <text class="sans cardbody" x="704" y="411">or save richer durable</text>
+    <text class="sans cardbody" x="704" y="432">state in project notes.</text>
     <rect x="704" y="472" width="108" height="26" rx="13" fill="#3A2A10"/>
     <text class="mono chip" x="758" y="489" fill="#F59E0B">NOTES TOOL</text>
   </g>
@@ -115,8 +115,8 @@
     <text class="mono num-inv" x="1016" y="339">4</text>
     <text class="sans cardtitle-inv" x="1040" y="341">Cut over</text>
     <text class="sans cardbody-inv" x="1008" y="390">new_context: the next</text>
-    <text class="sans cardbody-inv" x="1008" y="411">request keeps only the</text>
-    <text class="sans cardbody-inv" x="1008" y="432">current turn. No summary.</text>
+    <text class="sans cardbody-inv" x="1008" y="411">request starts a genuinely</text>
+    <text class="sans cardbody-inv" x="1008" y="432">fresh window. No summary.</text>
     <rect x="1008" y="472" width="116" height="26" rx="13" fill="#FFFFFF"/>
     <text class="mono chip" x="1066" y="489" fill="#4F46E5">NEW_CONTEXT</text>
   </g>
@@ -149,9 +149,9 @@
     <ellipse cx="1122" cy="696" rx="12" ry="5" fill="none" stroke="#F59E0B" stroke-width="2"/>
     <path d="M 1110 696 L 1110 716 A 12 5 0 0 0 1134 716 L 1134 696" fill="none" stroke="#F59E0B" stroke-width="2"/>
     <text class="mono storename" x="1148" y="700">session JSONL</text>
-    <text class="sans storebody" x="1148" y="722">full transcript — cuts never truncate it</text>
+    <text class="sans storebody" x="1148" y="722">full transcript + native window boundaries</text>
   </g>
 
   <!-- footer -->
-  <text class="mono footer" x="800" y="872">FALLBACK IF THE MODEL NEVER RESETS: PI AUTO-COMPACTION (BUILT-IN, UNCHANGED) · CACHE-SAFE TAIL INJECTION — MEASURED CACHE READ 28,041 / 28,097 TOKENS ON LATER TURNS</text>
+  <text class="mono footer" x="800" y="872">FALLBACK IF THE MODEL NEVER RESETS: AUTOMATIC NATIVE NO-SUMMARY ROLLOVER · SESSION JSONL REMAINS COMPLETE</text>
 </svg>

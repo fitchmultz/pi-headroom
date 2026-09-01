@@ -1,168 +1,257 @@
 /**
- * pi-headroom — model-managed context windows.
+ * pi-headroom — model-managed context windows for patched Pi.
  *
- * Codex-style hard context cutovers for pi, without compaction summaries:
- *  1. A [headroom] meter message shows live context usage before every LLM call.
- *  2. The model calls new_context to drop earlier conversation from context.
- *     The cut is non-destructive: the session file keeps the full transcript.
- *  3. The notes tool persists durable state in .pi/notes/ across resets.
- *  4. The history tool searches/reads dropped conversation from session JSONL.
- *
- * Auto-compaction stays enabled as the fallback if the model never resets.
+ * Pi owns the authoritative context boundary. This extension owns the policy:
+ * sparse budget reminders, rollover tools, durable notes, and history recovery.
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import {
+	type ExtensionAPI,
+	getAgentDir,
+	parseSessionEntries,
+	SettingsManager,
+	withFileMutationQueue,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type ExtensionAPI, getAgentDir, SettingsManager, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 
-const MARK = "[headroom]";
+const REMINDER_BUFFER_TOKENS = 32_000;
+const MAX_HANDOFF_CHARS = 20_000;
+const REMINDER_TYPE = "headroom-reminder";
+const AUTO_HANDOFF =
+	"Automatic context rollover. Reload durable state with the notes tool and use history if more detail is needed before continuing the task.";
 
-/**
- * Guidance is computed from the user's real compaction settings: the model's
- * cut decisions are anchored to the actual auto-compaction deadline, not an
- * assumed one. Re-resolved per agent run so mid-session settings changes apply.
- */
-function buildGuidance(cwd: string, contextWindow: number | undefined): string {
-	let enabled = true;
-	let reserveTokens = 16384;
-	try {
-		const s = SettingsManager.create(cwd, getAgentDir()).getCompactionSettings();
-		enabled = s.enabled;
-		reserveTokens = s.reserveTokens;
-	} catch {
-		// defaults already set
+type NativeContext = {
+	newContext(options?: { handoff?: string }): void;
+};
+
+type NativeExtensionAPI = {
+	on(
+		event: "session_before_compact",
+		handler: (event: { reason: "manual" | "overflow" | "threshold" }) =>
+			| { newContext: { handoff?: string } }
+			| undefined,
+	): void;
+};
+
+type MessageLike = { role?: string; content?: unknown };
+type EntryLike = {
+	type?: string;
+	id?: string;
+	parentId?: string | null;
+	timestamp?: string;
+	message?: MessageLike;
+	summary?: string;
+	customType?: string;
+	content?: unknown;
+	details?: unknown;
+	handoff?: string;
+};
+
+type WindowedEntry = { entry: EntryLike; windowId: string; text: string };
+
+function nativeContext<T>(ctx: T): T & NativeContext {
+	const candidate = ctx as T & Partial<NativeContext>;
+	if (typeof candidate.newContext !== "function") {
+		throw new Error("pi-headroom requires the native context-window Pi patch");
 	}
-	let deadline: string;
-	if (!enabled) {
-		deadline =
-			"Auto-compaction is DISABLED in the user's settings. You must manage the window yourself: save notes and call new_context before it fills, or the turn fails on overflow.";
-	} else if (contextWindow) {
-		const pct = Math.max(1, Math.round(((contextWindow - reserveTokens) / contextWindow) * 100));
-		deadline = `If you never reset, auto-compaction fires at ~${pct}% (reserveTokens=${reserveTokens.toLocaleString("en-US")}). For a clean transition, save notes and call new_context before that line.`;
-	} else {
-		deadline =
-			"If you never reset, auto-compaction fires near the end of the window. For a clean transition, save notes and call new_context before it fills.";
-	}
-	return `## Context self-management (pi-headroom)
-A [headroom] message before each response shows live context usage. It is routine telemetry, not a warning — below the compaction line it needs no action.
-${deadline}
-When you do reset: 1) save durable state with the notes tool (.pi/notes/ survives resets): goal, progress, decisions, next steps. 2) Call new_context. No summary is generated — earlier conversation leaves context but stays on disk. 3) Recover dropped conversation with the history tool; reload saved state with the notes tool.
-Never guess about content that left the window — check notes/history instead of answering from memory.`;
+	return candidate as T & NativeContext;
 }
 
-type AnyMsg = { role: string; content?: unknown };
-
-function textOf(m: AnyMsg): string {
-	const c = m.content;
-	if (typeof c === "string") return c;
-	if (Array.isArray(c)) return c.map((p) => (p?.type === "text" ? p.text : "")).join("\n");
-	return "";
+function textOf(message: MessageLike): string {
+	if (typeof message.content === "string") return message.content;
+	if (!Array.isArray(message.content)) return "";
+	return message.content
+		.map((part) => {
+			if (!part || typeof part !== "object") return "";
+			const block = part as { type?: string; text?: string; thinking?: string; name?: string; arguments?: unknown };
+			if (block.type === "text") return block.text ?? "";
+			if (block.type === "thinking") return block.thinking ?? "";
+			if (block.type === "toolCall") return `${block.name ?? "tool"} ${JSON.stringify(block.arguments ?? {})}`;
+			return "";
+		})
+		.filter(Boolean)
+		.join("\n");
 }
 
 function textResult(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
-function need(value: string | undefined, name: string, op: string): string {
+function requireValue(value: string | undefined, name: string, op: string): string {
 	if (!value) throw new Error(`"${name}" is required for op "${op}".`);
 	return value;
 }
 
-/** Flatten a session JSONL entry to readable text, or null for non-conversation entries. */
-function flattenEntry(e: any): string | null {
-	if (e?.type === "message") return `[${e.message?.role}] ${textOf(e.message ?? {})}`;
-	if (e?.type === "compaction" || e?.type === "branch_summary") return `[${e.type}] ${e.summary ?? ""}`;
-	if (e?.type === "custom_message") return `[custom:${e.customType}] ${textOf({ role: "custom", content: e.content })}`;
-	return null;
+function flattenEntry(entry: EntryLike): string | undefined {
+	if (entry.type === "message") return `[${entry.message?.role ?? "message"}] ${textOf(entry.message ?? {})}`;
+	if (entry.type === "compaction" || entry.type === "branch_summary") {
+		return `[${entry.type}] ${entry.summary ?? ""}`;
+	}
+	if (entry.type === "custom_message") {
+		return `[custom:${entry.customType ?? "unknown"}] ${textOf({ content: entry.content })}`;
+	}
+	if (entry.type === "context_window") {
+		return `[context_window] ${entry.handoff ? `Handoff: ${entry.handoff}` : "No handoff"}`;
+	}
+	return undefined;
+}
+
+function windowEntries(entries: readonly EntryLike[]): WindowedEntry[] {
+	const windows = new Map<string, string>();
+	const result: WindowedEntry[] = [];
+	for (const entry of entries) {
+		const inheritedWindow = entry.parentId ? (windows.get(entry.parentId) ?? "initial") : "initial";
+		const windowId = entry.type === "context_window" && entry.id ? entry.id : inheritedWindow;
+		if (entry.id) windows.set(entry.id, windowId);
+		const text = flattenEntry(entry);
+		if (text && entry.id) result.push({ entry, windowId, text });
+	}
+	return result;
+}
+
+function parseSession(file: string): EntryLike[] {
+	return existsSync(file) ? parseSessionEntries(readFileSync(file, "utf8")) : [];
 }
 
 function sessionFiles(dir: string): string[] {
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
-		.filter((f) => f.endsWith(".jsonl") && !f.includes(".intent."))
-		.map((f) => join(dir, f));
+		.filter((file) => file.endsWith(".jsonl") && !file.includes(".intent."))
+		.map((file) => join(dir, file));
 }
 
-const CUT_TYPE = "headroom-cut";
+function currentWindowId(entries: readonly EntryLike[]): string {
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i];
+		if (entry.type === "context_window" && entry.id) return entry.id;
+	}
+	return "initial";
+}
 
-function lastUserEntryId(ctx: { sessionManager: { getBranch(): any[] } }): string | undefined {
-	const branch = ctx.sessionManager.getBranch();
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const e = branch[i];
-		if (e?.type === "message" && e.message?.role === "user" && !textOf(e.message).startsWith(MARK)) return e.id;
+function hasReminder(entries: readonly EntryLike[], windowId: string): boolean {
+	return entries.some(
+		(entry) =>
+			entry.type === "custom_message" &&
+			entry.customType === REMINDER_TYPE &&
+			(entry.details as { windowId?: string } | undefined)?.windowId === windowId,
+	);
+}
+
+function getReserveTokens(cwd: string): number {
+	try {
+		return SettingsManager.create(cwd, getAgentDir()).getCompactionSettings().reserveTokens;
+	} catch {
+		return 16_384;
 	}
 }
 
-function latestCutId(ctx: { sessionManager: { getBranch(): any[] } }): string | undefined {
-	const branch = ctx.sessionManager.getBranch();
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const e = branch[i];
-		if (e?.type === "custom" && e.customType === CUT_TYPE) {
-			const id = e.data?.firstKeptEntryId;
-			if (typeof id === "string") return id;
-		}
-	}
+function getRolloverAt(cwd: string, contextWindow: number): number {
+	const reserveTokens = Math.min(getReserveTokens(cwd), Math.max(1, Math.floor(contextWindow / 2)));
+	return contextWindow - reserveTokens;
+}
+
+function buildGuidance(cwd: string, contextWindow: number | undefined): string {
+	const deadline = contextWindow
+		? `${Math.max(1, Math.round((getRolloverAt(cwd, contextWindow) / contextWindow) * 100))}% used`
+		: "the configured Pi context limit";
+	return `## Context self-management (pi-headroom)
+Context windows are finite. Use get_context_remaining when an exact reading matters; routine turns do not include a changing meter.
+One checkpoint reminder appears before the automatic rollover line (${deadline}). Save durable state with notes or pass a concise handoff to new_context.
+new_context starts a genuinely fresh Pi context after the complete tool batch. Earlier conversation remains in the session transcript and is recoverable with history.
+If the fallback line is reached, Pi starts a fresh window without generating a compaction summary. After any rollover, reload notes/history instead of guessing.`;
 }
 
 export default function (pi: ExtensionAPI) {
-	// Session-persisted cut: slice from this entry's user message onward.
-	let firstKeptEntryId: string | undefined;
-
-	const restoreCut = (_event: unknown, ctx: { sessionManager: { getBranch(): any[] } }) => {
-		firstKeptEntryId = latestCutId(ctx);
-	};
-	pi.on("session_start", restoreCut);
-	pi.on("session_tree", restoreCut);
+	pi.on("session_start", (_event, ctx) => {
+		nativeContext(ctx);
+	});
 
 	pi.on("before_agent_start", (event, ctx) => ({
-		systemPrompt: `${event.systemPrompt}\n\n${buildGuidance(ctx.cwd, ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow)}`,
+		systemPrompt: `${event.systemPrompt}\n\n${buildGuidance(ctx.cwd, ctx.model?.contextWindow)}`,
 	}));
 
-	pi.on("context", (event, ctx) => {
-		let messages = event.messages;
-		let notice = "";
-		const cutId = firstKeptEntryId ?? latestCutId(ctx);
-		if (cutId) {
-			firstKeptEntryId = cutId;
-			const kept = ctx.sessionManager.getEntry(cutId);
-			const ts = kept?.type === "message" ? kept.message?.timestamp : undefined;
-			const i = ts == null ? -1 : messages.findIndex((m) => m.timestamp === ts);
-			if (i > 0) {
-				messages = messages.slice(i);
-				notice =
-					" Started a new context window — earlier conversation dropped from context (still on disk; use the history tool). Notes persist in .pi/notes/.";
-			} else if (i === 0) {
-				notice = " Already in a fresh window — nothing was cut.";
-			}
+	pi.on("turn_end", (event, ctx) => {
+		if (
+			event.message.role === "assistant" &&
+			(event.message.stopReason === "error" || event.message.stopReason === "aborted")
+		)
+			return;
+		if (event.toolResults.some((result) => result.toolName === "new_context")) return;
+		const usage = ctx.getContextUsage();
+		if (usage?.tokens == null || usage.contextWindow <= 0) return;
+
+		const branch = ctx.sessionManager.getBranch() as EntryLike[];
+		const windowId = currentWindowId(branch);
+		const rolloverAt = getRolloverAt(ctx.cwd, usage.contextWindow);
+		const reminderBuffer = Math.min(REMINDER_BUFFER_TOKENS, Math.floor(usage.contextWindow * 0.1));
+		const remindAt = Math.max(0, rolloverAt - reminderBuffer);
+		const reminded = hasReminder(branch, windowId);
+
+		if (usage.tokens >= rolloverAt && reminded) {
+			nativeContext(ctx).newContext({ handoff: AUTO_HANDOFF });
+			return;
 		}
-		const u = ctx.getContextUsage();
-		const meter =
-			u?.tokens != null
-				? `${MARK}${notice} Context ${u.tokens.toLocaleString("en-US")}/${u.contextWindow.toLocaleString("en-US")} tokens (${Math.round(u.percent ?? 0)}% used).`
-				: `${MARK}${notice} Context usage unknown right now.`;
-		return { messages: [...messages, { role: "user" as const, content: meter, timestamp: Date.now() }] };
+
+		if (usage.tokens < remindAt || reminded) return;
+		pi.sendMessage(
+			{
+				customType: REMINDER_TYPE,
+				content: `[headroom] ${Math.max(0, usage.contextWindow - usage.tokens).toLocaleString("en-US")} tokens remain before the model limit. This is the one checkpoint before automatic no-summary rollover. Save durable state now or call new_context; if this window remains above ${rolloverAt.toLocaleString("en-US")} used tokens after the checkpoint, the next completed turn starts fresh.`,
+				display: true,
+				details: { windowId },
+			},
+			{ deliverAs: "steer" },
+		);
+	});
+
+	// Last-resort conversion of Pi's automatic summary path into the same hard rollover.
+	(pi as unknown as NativeExtensionAPI).on("session_before_compact", (event) => {
+		if (event.reason === "manual") return;
+		return { newContext: { handoff: AUTO_HANDOFF } };
 	});
 
 	pi.registerTool({
 		name: "new_context",
 		label: "New Context",
 		description:
-			"Start a new context window. Earlier conversation leaves context (no summary is generated) but stays on disk — recover it with the history tool. Notes in .pi/notes/ survive. Save durable state with the notes tool BEFORE calling this.",
-		promptSnippet: "start a fresh context window when this one is nearly full or no longer useful",
+			"Start a genuinely fresh context window after this tool batch. Earlier conversation leaves active context without a generated summary but remains recoverable through history. Pass concise continuation state in handoff, or save richer state with notes first.",
+		promptSnippet: "start a fresh context window with an optional atomic handoff",
 		promptGuidelines: [
-			"Always write durable state (goal, progress, decisions, next steps) with the notes tool before calling new_context — new_context does not summarize",
+			"Before calling new_context, pass concise continuation state in handoff or save durable goal/progress/decisions/next-steps with notes",
 		],
+		parameters: Type.Object({
+			handoff: Type.Optional(
+				Type.String({
+					description: "Concise state the fresh window needs to continue correctly",
+					maxLength: MAX_HANDOFF_CHARS,
+				}),
+			),
+		}),
+		async execute(_id, { handoff }, _signal, _onUpdate, ctx) {
+			nativeContext(ctx);
+			return {
+				...textResult(
+					"Requested a fresh Pi context after this complete tool batch succeeds. Earlier conversation stays in session history.",
+				),
+				newContext: { handoff: handoff?.trim() || undefined },
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "get_context_remaining",
+		label: "Context Remaining",
+		description: "Return the current native Pi context-window budget on demand.",
+		promptSnippet: "check exact remaining context only when needed",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const id = lastUserEntryId(ctx);
-			if (!id) {
-				return textResult("Already in a fresh window — nothing was cut.");
-			}
-			firstKeptEntryId = id;
-			pi.appendEntry(CUT_TYPE, { firstKeptEntryId: id });
+			const usage = ctx.getContextUsage();
+			if (!usage || usage.tokens == null) return textResult("Context usage is not known until the next model response.");
+			const remaining = Math.max(0, usage.contextWindow - usage.tokens);
 			return textResult(
-				"New context window starts on the next request. Earlier conversation is out of context but searchable with the history tool; notes persist in .pi/notes/.",
+				`${remaining.toLocaleString("en-US")} tokens remain (${usage.tokens.toLocaleString("en-US")}/${usage.contextWindow.toLocaleString("en-US")} used, ${Math.round(usage.percent ?? 0)}%).`,
 			);
 		},
 	});
@@ -174,8 +263,8 @@ export default function (pi: ExtensionAPI) {
 			"Persistent notes in .pi/notes/ that survive context resets. Ops: list, read, write (create/replace), append, search (case-insensitive substring over note lines).",
 		promptSnippet: "save and recall durable state that survives context resets",
 		promptGuidelines: [
-			"Use the notes tool to save goal/progress/decisions/next-steps before calling new_context",
-			"Use the notes tool after a context reset to reload saved state",
+			"Use notes for durable state too large for a new_context handoff",
+			"Reload relevant notes after a context rollover",
 		],
 		parameters: Type.Object({
 			op: Type.Union(
@@ -188,18 +277,18 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const dir = join(ctx.cwd, ".pi", "notes");
-			const safeJoin = (p: string) => {
-				const rel = normalize(p.replace(/^[/\\]+/, ""));
-				if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-					throw new Error(`Invalid path "${p}": must stay inside .pi/notes/.`);
+			const safeJoin = (path: string) => {
+				const relative = normalize(path.replace(/^[/\\]+/, ""));
+				if (relative === ".." || relative.startsWith(`..${sep}`) || isAbsolute(relative)) {
+					throw new Error(`Invalid path "${path}": must stay inside .pi/notes/.`);
 				}
-				return join(dir, rel);
+				return join(dir, relative);
 			};
-			const walk = (d: string, out: string[]) => {
-				for (const f of readdirSync(d)) {
-					const p = join(d, f);
-					if (statSync(p).isDirectory()) walk(p, out);
-					else out.push(p);
+			const walk = (directory: string, output: string[]) => {
+				for (const file of readdirSync(directory)) {
+					const path = join(directory, file);
+					if (statSync(path).isDirectory()) walk(path, output);
+					else output.push(path);
 				}
 			};
 
@@ -208,47 +297,50 @@ export default function (pi: ExtensionAPI) {
 					if (!existsSync(dir)) return textResult("(no notes yet)");
 					const files: string[] = [];
 					walk(dir, files);
-					return textResult(files.length ? files.map((f) => f.slice(dir.length + 1)).join("\n") : "(no notes yet)");
+					return textResult(files.length ? files.map((file) => file.slice(dir.length + 1)).join("\n") : "(no notes yet)");
 				}
 				case "read": {
-					const rel = need(params.path, "path", params.op);
-					const p = safeJoin(rel);
-					if (!existsSync(p)) throw new Error(`No note at ${rel}. Use op "list" to see available notes.`);
-					const text = readFileSync(p, "utf-8");
-					return textResult(text.length > 20_000 ? `${text.slice(0, 20_000)}\n… truncated (${text.length} chars total)` : text);
+					const relative = requireValue(params.path, "path", params.op);
+					const path = safeJoin(relative);
+					if (!existsSync(path)) throw new Error(`No note at ${relative}. Use op "list" to see available notes.`);
+					const text = readFileSync(path, "utf8");
+					return textResult(
+						text.length > MAX_HANDOFF_CHARS
+							? `${text.slice(0, MAX_HANDOFF_CHARS)}\n… truncated (${text.length} chars total)`
+							: text,
+					);
 				}
 				case "write":
 				case "append": {
-					const rel = need(params.path, "path", params.op);
-					const content = need(params.content, "content", params.op);
-					const p = safeJoin(rel);
-					mkdirSync(dirname(p), { recursive: true });
-					await withFileMutationQueue(p, async () => {
-						if (params.op === "write") {
-							writeFileSync(p, content);
-						} else {
-							const prev = existsSync(p) ? readFileSync(p, "utf-8") : "";
-							appendFileSync(p, prev && !prev.endsWith("\n") ? `\n${content}` : content);
+					const relative = requireValue(params.path, "path", params.op);
+					const content = requireValue(params.content, "content", params.op);
+					const path = safeJoin(relative);
+					mkdirSync(dirname(path), { recursive: true });
+					await withFileMutationQueue(path, async () => {
+						if (params.op === "write") writeFileSync(path, content);
+						else {
+							const previous = existsSync(path) ? readFileSync(path, "utf8") : "";
+							appendFileSync(path, previous && !previous.endsWith("\n") ? `\n${content}` : content);
 						}
 					});
-					return textResult(`${params.op === "write" ? "Wrote" : "Appended to"} .pi/notes/${rel}`);
+					return textResult(`${params.op === "write" ? "Wrote" : "Appended to"} .pi/notes/${relative}`);
 				}
 				case "search": {
-					const q = need(params.query, "query", params.op).toLowerCase();
+					const query = requireValue(params.query, "query", params.op).toLowerCase();
 					if (!existsSync(dir)) return textResult("(no notes yet)");
 					const files: string[] = [];
 					walk(dir, files);
 					const hits: string[] = [];
-					for (const f of files) {
-						for (const [i, line] of readFileSync(f, "utf-8").split("\n").entries()) {
+					for (const file of files) {
+						for (const [index, line] of readFileSync(file, "utf8").split("\n").entries()) {
 							if (hits.length >= 20) break;
-							if (line.toLowerCase().includes(q)) hits.push(`${f.slice(dir.length + 1)}:${i + 1}: ${line.trim().slice(0, 200)}`);
+							if (line.toLowerCase().includes(query)) {
+								hits.push(`${file.slice(dir.length + 1)}:${index + 1}: ${line.trim().slice(0, 200)}`);
+							}
 						}
 					}
 					return textResult(hits.length ? hits.join("\n") : `No notes match "${params.query}".`);
 				}
-				default:
-					throw new Error(`Unknown op "${params.op}".`);
 			}
 		},
 	});
@@ -257,66 +349,63 @@ export default function (pi: ExtensionAPI) {
 		name: "history",
 		label: "History",
 		description:
-			"Search and read this session's full transcript — including conversation dropped by new_context — or past sessions of this project. Ops: search, read.",
-		promptSnippet: "recover earlier conversation that left the context window",
-		promptGuidelines: ["Use history search first, then history read on a specific entry id for full content"],
+			"Search or read normalized session entries, including earlier native context windows. Current branch is searched by default; all=true searches project session files. Long reads return the next offset for complete recovery.",
+		promptSnippet: "recover earlier conversation that left the active context window",
+		promptGuidelines: ["Use history search first, then history read with the returned entry id"],
 		parameters: Type.Object({
 			op: Type.Union([Type.Literal("search"), Type.Literal("read")], { description: "Operation to perform" }),
-			query: Type.Optional(Type.String({ description: "Substring to find, case-insensitive (search)" })),
-			id: Type.Optional(Type.String({ description: "Entry id from a search result (read)" })),
-			all: Type.Optional(Type.Boolean({ description: "Search all sessions of this project, not just the current one (search)" })),
-			limit: Type.Optional(Type.Integer({ description: "Max results (default 10, max 50)", minimum: 1, maximum: 50 })),
+			query: Type.Optional(Type.String({ description: "Case-insensitive text to find (search)" })),
+			id: Type.Optional(Type.String({ description: "Entry id returned by search (read)" })),
+			all: Type.Optional(Type.Boolean({ description: "Search all project sessions instead of the current branch" })),
+			limit: Type.Optional(Type.Integer({ description: "Maximum results (default 10, max 50)", minimum: 1, maximum: 50 })),
+			offset: Type.Optional(Type.Integer({ description: "Character offset for read (default 0)", minimum: 0 })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const sm = ctx.sessionManager;
-			const current = sm.getSessionFile();
-			const files = params.all
-				? sessionFiles(sm.getSessionDir())
-				: current
-					? [current]
-					: sessionFiles(sm.getSessionDir()).slice(-1);
-			if (files.length === 0) return textResult("(no persisted session history yet)");
+			const manager = ctx.sessionManager;
+			const current = windowEntries(manager.getBranch() as EntryLike[]);
+			const files = sessionFiles(manager.getSessionDir());
 
 			if (params.op === "search") {
-				const q = need(params.query, "query", params.op).toLowerCase();
+				const query = requireValue(params.query, "query", params.op).toLowerCase();
 				const limit = params.limit ?? 10;
-				const results: string[] = [];
-				for (const file of files) {
-					for (const line of readFileSync(file, "utf-8").split("\n")) {
-						if (results.length >= limit) break;
-						if (!line.toLowerCase().includes(q)) continue;
-						let e: any;
-						try {
-							e = JSON.parse(line);
-						} catch {
-							continue;
-						}
-						const flat = flattenEntry(e);
-						if (!flat) continue;
-						const excerpt = flat.length > 400 ? `${flat.slice(0, 400)}…` : flat;
-						results.push(`${params.all ? `${basename(file)} ` : ""}${e.timestamp ?? ""} [${e.id}] ${excerpt}`);
+				const sources = params.all
+					? files.map((file) => ({ name: basename(file), entries: windowEntries(parseSession(file)) }))
+					: [{ name: "", entries: current }];
+				const hits: string[] = [];
+				for (const source of sources) {
+					for (const item of source.entries) {
+						if (hits.length >= limit) break;
+						const matchIndex = item.text.toLowerCase().indexOf(query);
+						if (matchIndex === -1) continue;
+						const excerptStart = Math.max(0, matchIndex - 100);
+						const excerpt = `${excerptStart ? "…" : ""}${item.text.slice(excerptStart, excerptStart + 400)}${excerptStart + 400 < item.text.length ? "…" : ""}`;
+						const prefix = source.name ? `${source.name} ` : "";
+						hits.push(
+							`${prefix}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${item.entry.id}] ${excerpt}`,
+						);
 					}
 				}
-				return textResult(results.length ? results.join("\n") : `No history matches "${params.query}".`);
+				return textResult(hits.length ? hits.join("\n") : `No history matches "${params.query}".`);
 			}
 
-			// read: find one entry by id across current + project sessions
-			const id = need(params.id, "id", params.op);
-			for (const file of params.all ? files : [...files, ...sessionFiles(sm.getSessionDir())]) {
-				for (const line of readFileSync(file, "utf-8").split("\n")) {
-					if (!line.includes(id)) continue;
-					let e: any;
-					try {
-						e = JSON.parse(line);
-					} catch {
-						continue;
-					}
-					if (e?.id !== id) continue;
-					const flat = flattenEntry(e) ?? line;
-					return textResult(
-						`${e.timestamp ?? ""} [${e.id}] ${flat.length > 20_000 ? `${flat.slice(0, 20_000)}… truncated` : flat}`,
-					);
+			const id = requireValue(params.id, "id", params.op);
+			const sources = [
+				{ name: "", entries: current },
+				...files.map((file) => ({ name: basename(file), entries: windowEntries(parseSession(file)) })),
+			];
+			for (const source of sources) {
+				const item = source.entries.find((candidate) => candidate.entry.id === id);
+				if (!item) continue;
+				const offset = params.offset ?? 0;
+				if (offset >= item.text.length) {
+					throw new Error(`Offset ${offset} is past the end of history entry "${id}" (${item.text.length} chars).`);
 				}
+				const end = Math.min(item.text.length, offset + MAX_HANDOFF_CHARS);
+				const prefix = source.name ? `${source.name} ` : "";
+				const more = end < item.text.length ? `\nMore remains; call history read with id "${id}" and offset ${end}.` : "";
+				return textResult(
+					`${prefix}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${id}] [chars ${offset}-${end} of ${item.text.length}] ${item.text.slice(offset, end)}${more}`,
+				);
 			}
 			throw new Error(`No history entry with id "${id}".`);
 		},
