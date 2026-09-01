@@ -8,15 +8,15 @@ The model gets stable window guidance, one near-limit checkpoint reminder, and a
 
 ## Requirement
 
-This version requires the [`native-context-windows`](https://github.com/fitchmultz/pi/tree/feature/native-context-windows) Pi patch. The official Pi package does not yet provide the native boundary used here.
+This version requires the native context-window patch on the personal [`fitchmultz/pi`](https://github.com/fitchmultz/pi) fork. The official Pi package does not yet provide the native boundary used here.
 
-Build the patched worktree, then launch its CLI directly with the extension:
+Build the patched checkout, then launch its CLI directly with the extension:
 
 ```bash
-cd /Users/mitchfultz/Projects/worktrees/pi/native-context-windows
+cd /Users/mitchfultz/Projects/pi
 npm run build
 node packages/coding-agent/dist/bundle/cli.js \
-  -e /Users/mitchfultz/Projects/worktrees/pi-headroom/native-context-windows/index.ts
+  -e /Users/mitchfultz/Projects/pi-stuff/pi-headroom/index.ts
 ```
 
 Do not use bare `pi` for this version: that still resolves to the unchanged official global install.
