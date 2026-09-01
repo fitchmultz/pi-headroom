@@ -1,6 +1,6 @@
 {
 	"name": "pi-headroom",
-	"version": "0.2.1",
+	"version": "0.2.2",
 	"type": "module",
 	"description": "Native no-summary context windows for a personal patched Pi, with sparse budget reminders, handoffs, notes, and history.",
 	"keywords": ["pi-package", "pi-extension", "context", "headroom"],
