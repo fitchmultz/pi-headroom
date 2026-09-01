@@ -27,7 +27,7 @@ Do not use bare `pi` for this version: that still resolves to the unchanged offi
 2. **Sparse reminder** — one checkpoint message appears before Pi's configured compaction reserve line.
 3. **`get_context_remaining`** — returns an exact native usage reading only when the model needs it.
 4. **`new_context`** — requests an atomic rollover after the complete tool batch. An optional handoff is persisted and becomes the first state in the fresh window.
-5. **Automatic fallback** — Pi's automatic summary-compaction path is converted into the same no-summary rollover.
+5. **Automatic fallback** — Pi's automatic summary-compaction path becomes the same no-summary rollover. Active work continues, completed work stays finished, and the automatic handoff carries the current user requests and constraints.
 6. **`notes` and `history`** — durable project notes and normalized, window-aware transcript recovery remain available after rollover.
 
 Pi persists a real `context_window` session entry. Session replay, usage accounting, branch navigation, compaction, and provider input all use the same authoritative boundary; the JSONL transcript remains append-only and complete.

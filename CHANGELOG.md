@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2
+
+- Keeps active work running across automatic rollovers without starting another response after completed work.
+- Carries the current window's user requests and constraints into automatic handoffs.
+
 ## 0.2.1
 
 - Streams archived history and stops at the requested entry or result limit, preventing heap exhaustion in large session directories and parallel reads.

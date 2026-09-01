@@ -28,8 +28,8 @@ import { Type } from "typebox";
 const REMINDER_BUFFER_TOKENS = 32_000;
 const MAX_HANDOFF_CHARS = 20_000;
 const REMINDER_TYPE = "headroom-reminder";
-const AUTO_HANDOFF =
-	"Automatic context rollover. Reload durable state with the notes tool and use history if more detail is needed before continuing the task.";
+const AUTO_HANDOFF_PREFIX =
+	"Automatic context rollover. Continue the current task without asking the user to repeat it.";
 
 type NativeContext = {
 	newContext(options?: { handoff?: string }): void;
@@ -38,9 +38,10 @@ type NativeContext = {
 type NativeExtensionAPI = {
 	on(
 		event: "session_before_compact",
-		handler: (event: { reason: "manual" | "overflow" | "threshold" }) =>
-			| { newContext: { handoff?: string } }
-			| undefined,
+		handler: (event: {
+			reason: "manual" | "overflow" | "threshold";
+			branchEntries: EntryLike[];
+		}) => { newContext: { handoff?: string } } | undefined,
 	): void;
 };
 
@@ -160,6 +161,38 @@ function currentWindowId(entries: readonly EntryLike[]): string {
 	return "initial";
 }
 
+function buildAutoHandoff(entries: readonly EntryLike[]): string {
+	let windowStart = 0;
+	let priorHandoff: string | undefined;
+	for (let i = entries.length - 1; i >= 0; i--) {
+		if (entries[i].type === "context_window") {
+			windowStart = i + 1;
+			priorHandoff = entries[i].handoff;
+			break;
+		}
+	}
+	const userMessages = entries
+		.slice(windowStart)
+		.filter((entry) => entry.type === "message" && entry.message?.role === "user")
+		.map((entry) => entry.message ?? {});
+	const requests = userMessages
+		.map((message) => textOf(message).trim())
+		.filter(Boolean)
+		.map((text, index) => `[user ${index + 1}]\n${text}`)
+		.join("\n\n");
+	if (userMessages.length === 0) return priorHandoff || AUTO_HANDOFF_PREFIX;
+	if (!requests) return AUTO_HANDOFF_PREFIX;
+
+	const header = `${AUTO_HANDOFF_PREFIX}\n\nUser requests and constraints from the previous window:\n`;
+	const available = MAX_HANDOFF_CHARS - header.length;
+	if (requests.length <= available) return `${header}${requests}`;
+
+	const omitted = "\n\n… middle user messages omitted …\n\n";
+	const firstLength = Math.floor((available - omitted.length) / 2);
+	const lastLength = available - omitted.length - firstLength;
+	return `${header}${requests.slice(0, firstLength)}${omitted}${requests.slice(-lastLength)}`;
+}
+
 function hasReminder(entries: readonly EntryLike[], windowId: string): boolean {
 	return entries.some(
 		(entry) =>
@@ -190,7 +223,7 @@ function buildGuidance(cwd: string, contextWindow: number | undefined): string {
 Context windows are finite. Use get_context_remaining when an exact reading matters; routine turns do not include a changing meter.
 One checkpoint reminder appears before the automatic rollover line (${deadline}). Save durable state with notes or pass a concise handoff to new_context.
 new_context starts a genuinely fresh Pi context after the complete tool batch. Earlier conversation remains in the session transcript and is recoverable with history.
-If the fallback line is reached, Pi starts a fresh window without generating a compaction summary. After any rollover, reload notes/history instead of guessing.`;
+If the fallback line is reached, Pi carries the current user requests and constraints into a fresh window without generating a compaction summary. Active work continues automatically; a completed answer resets quietly.`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -220,7 +253,7 @@ export default function (pi: ExtensionAPI) {
 		const reminded = hasReminder(branch, windowId);
 
 		if (usage.tokens >= rolloverAt && reminded) {
-			nativeContext(ctx).newContext({ handoff: AUTO_HANDOFF });
+			nativeContext(ctx).newContext({ handoff: buildAutoHandoff(branch) });
 			return;
 		}
 
@@ -239,7 +272,7 @@ export default function (pi: ExtensionAPI) {
 	// Last-resort conversion of Pi's automatic summary path into the same hard rollover.
 	(pi as unknown as NativeExtensionAPI).on("session_before_compact", (event) => {
 		if (event.reason === "manual") return;
-		return { newContext: { handoff: AUTO_HANDOFF } };
+		return { newContext: { handoff: buildAutoHandoff(event.branchEntries) } };
 	});
 
 	pi.registerTool({

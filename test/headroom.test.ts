@@ -65,12 +65,24 @@ test("new_context returns a native atomic handoff and no context hook is registe
 		.execute("id", { handoff: "continue here" }, new AbortController().signal, () => {}, context);
 	assert.deepEqual(result.newContext, { handoff: "continue here" });
 	assert.equal(handlers.get("session_before_compact")!({ reason: "manual" }, context), undefined);
-	assert.match(
+	const automaticHandoff = (branchEntries: Record<string, unknown>[]) =>
 		(
-			handlers.get("session_before_compact")!({ reason: "threshold" }, context) as {
-				newContext: { handoff: string };
-			}
-		).newContext.handoff,
+			handlers.get("session_before_compact")!(
+				{ reason: "threshold", branchEntries },
+				context,
+			) as { newContext: { handoff: string } }
+		).newContext.handoff;
+	const currentHandoff = automaticHandoff([
+		{ type: "message", id: "user", message: { role: "user", content: "keep working on the fix" } },
+	]);
+	assert.match(currentHandoff, /Automatic context rollover/);
+	assert.match(currentHandoff, /keep working on the fix/);
+	assert.equal(automaticHandoff([{ type: "context_window", id: "prior", handoff: "persisted task" }]), "persisted task");
+	assert.match(
+		automaticHandoff([
+			{ type: "context_window", id: "prior", handoff: "persisted task" },
+			{ type: "message", id: "image", message: { role: "user", content: [{ type: "image" }] } },
+		]),
 		/Automatic context rollover/,
 	);
 });
@@ -83,7 +95,23 @@ test("budget policy sends one reminder then requests automatic rollover", () => 
 		const reserve = SettingsManager.create(dir, getAgentDir()).getCompactionSettings().reserveTokens;
 		const rolloverAt = contextWindow - Math.min(reserve, Math.floor(contextWindow / 2));
 		const tokens = rolloverAt;
-		const branch: Record<string, unknown>[] = [];
+		const branch: Record<string, unknown>[] = [
+			{ type: "message", id: "old-user", message: { role: "user", content: "old completed task" } },
+			{ type: "context_window", id: "window-2" },
+			{
+				type: "message",
+				id: "current-user-1",
+				message: {
+					role: "user",
+					content: `Test production only. Do not contact other agents. ${"a".repeat(11_000)}`,
+				},
+			},
+			{
+				type: "message",
+				id: "current-user-2",
+				message: { role: "user", content: `${"b".repeat(11_000)} Write the three prompts.` },
+			},
+		];
 		const rollovers: Array<{ handoff?: string }> = [];
 		const context: TestContext = {
 			cwd: dir,
@@ -127,7 +155,13 @@ test("budget policy sends one reminder then requests automatic rollover", () => 
 		);
 		assert.equal(messages.length, 1);
 		assert.equal(rollovers.length, 1);
-		assert.match(rollovers[0].handoff ?? "", /Automatic context rollover/);
+		const handoff = rollovers[0].handoff ?? "";
+		assert.match(handoff, /Automatic context rollover/);
+		assert.match(handoff, /Test production only\. Do not contact other agents\./);
+		assert.match(handoff, /Write the three prompts\./);
+		assert.doesNotMatch(handoff, /old completed task/);
+		assert.match(handoff, /middle user messages omitted/);
+		assert.equal(handoff.length, 20_000);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
