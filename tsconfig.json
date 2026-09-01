@@ -3,9 +3,10 @@
 		"target": "ES2022",
 		"module": "ESNext",
 		"moduleResolution": "bundler",
+		"allowImportingTsExtensions": true,
 		"strict": true,
 		"noEmit": true,
 		"skipLibCheck": true
 	},
-	"include": ["index.ts"]
+	"include": ["index.ts", "test/**/*.ts"]
 }

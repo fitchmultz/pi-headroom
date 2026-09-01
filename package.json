@@ -1,9 +1,8 @@
 {
 	"name": "pi-headroom",
-	"version": "0.1.3",
-	"private": true,
+	"version": "0.2.0",
 	"type": "module",
-	"description": "Model-managed context windows for pi: live token meter, new_context cutover tool, persistent notes, transcript history search.",
+	"description": "Native no-summary context windows for a personal patched Pi, with sparse budget reminders, handoffs, notes, and history.",
 	"keywords": ["pi-package", "pi-extension", "context", "headroom"],
 	"repository": {
 		"type": "git",
@@ -18,7 +17,8 @@
 		"image": "https://raw.githubusercontent.com/fitchmultz/pi-headroom/main/diagram.png"
 	},
 	"scripts": {
-		"check": "tsc --noEmit"
+		"check": "tsc --noEmit",
+		"test": "node --test test/headroom.test.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",
