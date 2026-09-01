@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -128,6 +128,55 @@ test("budget policy sends one reminder then requests automatic rollover", () => 
 		assert.equal(messages.length, 1);
 		assert.equal(rollovers.length, 1);
 		assert.match(rollovers[0].handoff ?? "", /Automatic context rollover/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("history reads current entries without opening every archived session", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-history-test-"));
+	try {
+		mkdirSync(join(dir, "unrelated.jsonl"));
+		const { tools } = setup();
+		const context: TestContext = {
+			cwd: process.cwd(),
+			model: { contextWindow: 100_000 },
+			sessionManager: {
+				getBranch: () => [
+					{ type: "message", id: "current", parentId: null, timestamp: "1", message: { role: "user", content: "keep me" } },
+				],
+				getSessionDir: () => dir,
+			},
+			getContextUsage: () => ({ tokens: 1000, contextWindow: 100_000, percent: 1 }),
+			newContext: () => {},
+		};
+
+		const reads = await Promise.all(
+			Array.from({ length: 5 }, () =>
+				tools
+					.get("history")!
+					.execute("id", { op: "read", id: "current" }, new AbortController().signal, () => {}, context),
+			),
+		);
+		for (const result of reads) assert.match(toolText(result), /keep me/);
+
+		rmSync(join(dir, "unrelated.jsonl"), { recursive: true });
+		writeFileSync(
+			join(dir, "archived.jsonl"),
+			[
+				"not json",
+				JSON.stringify({ type: "context_window", id: "archived-window", parentId: null, timestamp: "2", handoff: "resume" }),
+				JSON.stringify({ type: "message", id: "archived", parentId: "archived-window", timestamp: "3", message: { role: "user", content: "archived needle" } }),
+			].join("\n"),
+		);
+		const archived = await tools
+			.get("history")!
+			.execute("id", { op: "read", id: "archived" }, new AbortController().signal, () => {}, context);
+		assert.match(toolText(archived), /^archived\.jsonl .+\[window archived-window\].+archived needle/s);
+		const search = await tools
+			.get("history")!
+			.execute("id", { op: "search", query: "archived needle", all: true }, new AbortController().signal, () => {}, context);
+		assert.match(toolText(search), /^archived\.jsonl .+\[window archived-window\].+archived needle/s);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
