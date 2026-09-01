@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Streams archived history and stops at the requested entry or result limit, preventing heap exhaustion in large session directories and parallel reads.
+
 ## 0.2.0
 
 - Replaces extension-only context slicing with Pi's native, persisted `context_window` boundary.

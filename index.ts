@@ -5,12 +5,21 @@
  * sparse budget reminders, rollover tools, durable notes, and history recovery.
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+	appendFileSync,
+	createReadStream,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	readdirSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { createInterface } from "node:readline";
 import {
 	type ExtensionAPI,
 	getAgentDir,
-	parseSessionEntries,
 	SettingsManager,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
@@ -98,21 +107,42 @@ function flattenEntry(entry: EntryLike): string | undefined {
 	return undefined;
 }
 
-function windowEntries(entries: readonly EntryLike[]): WindowedEntry[] {
-	const windows = new Map<string, string>();
-	const result: WindowedEntry[] = [];
-	for (const entry of entries) {
-		const inheritedWindow = entry.parentId ? (windows.get(entry.parentId) ?? "initial") : "initial";
-		const windowId = entry.type === "context_window" && entry.id ? entry.id : inheritedWindow;
-		if (entry.id) windows.set(entry.id, windowId);
-		const text = flattenEntry(entry);
-		if (text && entry.id) result.push({ entry, windowId, text });
-	}
-	return result;
+function toWindowedEntry(entry: EntryLike, windows: Map<string, string>): WindowedEntry | undefined {
+	const inheritedWindow = entry.parentId ? (windows.get(entry.parentId) ?? "initial") : "initial";
+	const windowId = entry.type === "context_window" && entry.id ? entry.id : inheritedWindow;
+	if (entry.id) windows.set(entry.id, windowId);
+	const text = flattenEntry(entry);
+	return text && entry.id ? { entry, windowId, text } : undefined;
 }
 
-function parseSession(file: string): EntryLike[] {
-	return existsSync(file) ? parseSessionEntries(readFileSync(file, "utf8")) : [];
+function* windowEntries(entries: Iterable<EntryLike>): Generator<WindowedEntry> {
+	const windows = new Map<string, string>();
+	for (const entry of entries) {
+		const item = toWindowedEntry(entry, windows);
+		if (item) yield item;
+	}
+}
+
+async function* sessionWindowEntries(file: string, signal?: AbortSignal): AsyncGenerator<WindowedEntry> {
+	if (!existsSync(file)) return;
+	const stream = createReadStream(file, { encoding: "utf8", signal });
+	const lines = createInterface({ input: stream, crlfDelay: Number.POSITIVE_INFINITY });
+	const windows = new Map<string, string>();
+	try {
+		for await (const line of lines) {
+			let entry: EntryLike;
+			try {
+				entry = JSON.parse(line) as EntryLike;
+			} catch {
+				continue;
+			}
+			const item = toWindowedEntry(entry, windows);
+			if (item) yield item;
+		}
+	} finally {
+		lines.close();
+		stream.destroy();
+	}
 }
 
 function sessionFiles(dir: string): string[] {
@@ -360,52 +390,61 @@ export default function (pi: ExtensionAPI) {
 			limit: Type.Optional(Type.Integer({ description: "Maximum results (default 10, max 50)", minimum: 1, maximum: 50 })),
 			offset: Type.Optional(Type.Integer({ description: "Character offset for read (default 0)", minimum: 0 })),
 		}),
-		async execute(_id, params, _signal, _onUpdate, ctx) {
+		async execute(_id, params, signal, _onUpdate, ctx) {
 			const manager = ctx.sessionManager;
 			const current = windowEntries(manager.getBranch() as EntryLike[]);
-			const files = sessionFiles(manager.getSessionDir());
 
 			if (params.op === "search") {
 				const query = requireValue(params.query, "query", params.op).toLowerCase();
 				const limit = params.limit ?? 10;
-				const sources = params.all
-					? files.map((file) => ({ name: basename(file), entries: windowEntries(parseSession(file)) }))
-					: [{ name: "", entries: current }];
 				const hits: string[] = [];
-				for (const source of sources) {
-					for (const item of source.entries) {
+				const addHit = (item: WindowedEntry, source = "") => {
+					const matchIndex = item.text.toLowerCase().indexOf(query);
+					if (matchIndex === -1) return;
+					const excerptStart = Math.max(0, matchIndex - 100);
+					const excerpt = `${excerptStart ? "…" : ""}${item.text.slice(excerptStart, excerptStart + 400)}${excerptStart + 400 < item.text.length ? "…" : ""}`;
+					hits.push(
+						`${source ? `${source} ` : ""}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${item.entry.id}] ${excerpt}`,
+					);
+				};
+
+				if (params.all) {
+					files: for (const file of sessionFiles(manager.getSessionDir())) {
+						const source = basename(file);
+						for await (const item of sessionWindowEntries(file, signal)) {
+							addHit(item, source);
+							if (hits.length >= limit) break files;
+						}
+					}
+				} else {
+					for (const item of current) {
+						addHit(item);
 						if (hits.length >= limit) break;
-						const matchIndex = item.text.toLowerCase().indexOf(query);
-						if (matchIndex === -1) continue;
-						const excerptStart = Math.max(0, matchIndex - 100);
-						const excerpt = `${excerptStart ? "…" : ""}${item.text.slice(excerptStart, excerptStart + 400)}${excerptStart + 400 < item.text.length ? "…" : ""}`;
-						const prefix = source.name ? `${source.name} ` : "";
-						hits.push(
-							`${prefix}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${item.entry.id}] ${excerpt}`,
-						);
 					}
 				}
 				return textResult(hits.length ? hits.join("\n") : `No history matches "${params.query}".`);
 			}
 
 			const id = requireValue(params.id, "id", params.op);
-			const sources = [
-				{ name: "", entries: current },
-				...files.map((file) => ({ name: basename(file), entries: windowEntries(parseSession(file)) })),
-			];
-			for (const source of sources) {
-				const item = source.entries.find((candidate) => candidate.entry.id === id);
-				if (!item) continue;
+			const formatEntry = (item: WindowedEntry, source = "") => {
 				const offset = params.offset ?? 0;
 				if (offset >= item.text.length) {
 					throw new Error(`Offset ${offset} is past the end of history entry "${id}" (${item.text.length} chars).`);
 				}
 				const end = Math.min(item.text.length, offset + MAX_HANDOFF_CHARS);
-				const prefix = source.name ? `${source.name} ` : "";
 				const more = end < item.text.length ? `\nMore remains; call history read with id "${id}" and offset ${end}.` : "";
 				return textResult(
-					`${prefix}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${id}] [chars ${offset}-${end} of ${item.text.length}] ${item.text.slice(offset, end)}${more}`,
+					`${source ? `${source} ` : ""}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${id}] [chars ${offset}-${end} of ${item.text.length}] ${item.text.slice(offset, end)}${more}`,
 				);
+			};
+
+			for (const item of current) {
+				if (item.entry.id === id) return formatEntry(item);
+			}
+			for (const file of sessionFiles(manager.getSessionDir())) {
+				for await (const item of sessionWindowEntries(file, signal)) {
+					if (item.entry.id === id) return formatEntry(item, basename(file));
+				}
 			}
 			throw new Error(`No history entry with id "${id}".`);
 		},
