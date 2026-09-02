@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0
+
+- Rebuilds automatic handoffs as bounded recovery records that retain direct user inputs, `ask_question` outcomes, visible coordination, and a clearly stale older checkpoint without inferring state from assistant prose.
+- Lets Pi's enabled automatic compaction lifecycle own threshold, overflow, and restart rollovers; disabling compaction now disables automatic headroom behavior while leaving `new_context` available.
+- Makes the checkpoint reminder imperative and best-effort, aligns its cutoff with Pi's first actual trigger token, and filters wrong-window reminders from model input.
+- Searches nested session files and returns newest history matches first while keeping reads streaming and bounded.
+
 ## 0.2.2
 
 - Keeps active work running across automatic rollovers without starting another response after completed work.

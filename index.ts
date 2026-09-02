@@ -15,7 +15,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 import { createInterface } from "node:readline";
 import {
 	type ExtensionAPI,
@@ -27,8 +27,11 @@ import { Type } from "typebox";
 
 const REMINDER_BUFFER_TOKENS = 32_000;
 const MAX_HANDOFF_CHARS = 20_000;
+const MAX_RECOVERY_RECORD_CHARS = 4_000;
+const HANDOFF_OVERHEAD_RESERVE = 1_000;
 const REMINDER_TYPE = "headroom-reminder";
-const AUTO_HANDOFF_PREFIX =
+const AUTO_HANDOFF_PREFIX = "Automatic context rollover recovery record.";
+const LEGACY_AUTO_HANDOFF_PREFIX =
 	"Automatic context rollover. Continue the current task without asking the user to repeat it.";
 
 type NativeContext = {
@@ -45,7 +48,7 @@ type NativeExtensionAPI = {
 	): void;
 };
 
-type MessageLike = { role?: string; content?: unknown };
+type MessageLike = { role?: string; content?: unknown; toolName?: string; isError?: boolean };
 type EntryLike = {
 	type?: string;
 	id?: string;
@@ -56,10 +59,18 @@ type EntryLike = {
 	customType?: string;
 	content?: unknown;
 	details?: unknown;
+	display?: boolean;
 	handoff?: string;
 };
 
 type WindowedEntry = { entry: EntryLike; windowId: string; text: string };
+type RecoveryRecord = {
+	id: string;
+	timestamp: string;
+	kind: "owner" | "coordination";
+	label: string;
+	text: string;
+};
 
 function nativeContext<T>(ctx: T): T & NativeContext {
 	const candidate = ctx as T & Partial<NativeContext>;
@@ -148,9 +159,10 @@ async function* sessionWindowEntries(file: string, signal?: AbortSignal): AsyncG
 
 function sessionFiles(dir: string): string[] {
 	if (!existsSync(dir)) return [];
-	return readdirSync(dir)
-		.filter((file) => file.endsWith(".jsonl") && !file.includes(".intent."))
-		.map((file) => join(dir, file));
+	return readdirSync(dir, { recursive: true, withFileTypes: true })
+		.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl") && !entry.name.includes(".intent."))
+		.map((entry) => join(entry.parentPath, entry.name))
+		.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
 }
 
 function currentWindowId(entries: readonly EntryLike[]): string {
@@ -161,36 +173,124 @@ function currentWindowId(entries: readonly EntryLike[]): string {
 	return "initial";
 }
 
+function excerpt(text: string, limit: number): string {
+	if (text.length <= limit) return text;
+	const marker = "\n… middle omitted …\n";
+	const head = Math.floor((limit - marker.length) / 2);
+	return `${text.slice(0, head)}${marker}${text.slice(text.length - (limit - marker.length - head))}`;
+}
+
+function boundedBlock(header: string, text: string): string {
+	return `${header}\n${excerpt(text, MAX_RECOVERY_RECORD_CHARS - header.length - 1)}`;
+}
+
+function recoveryRecord(entry: EntryLike): RecoveryRecord | undefined {
+	let kind: RecoveryRecord["kind"];
+	let label: string;
+	let text: string;
+	if (entry.type === "message" && entry.message?.role === "user") {
+		kind = "owner";
+		label = "owner input";
+		text = textOf(entry.message).trim();
+	} else if (
+		entry.type === "message" &&
+		entry.message?.role === "toolResult" &&
+		entry.message.toolName === "ask_question" &&
+		entry.message.isError !== true
+	) {
+		kind = "owner";
+		label = "owner answer via ask_question";
+		text = textOf(entry.message).trim();
+	} else if (entry.type === "custom_message" && entry.display === true && entry.customType !== REMINDER_TYPE) {
+		kind = "coordination";
+		label = `visible ${(entry.customType ?? "custom").slice(0, 80)} coordination input (not direct owner input)`;
+		text = textOf({ content: entry.content }).trim();
+	} else {
+		return undefined;
+	}
+	return {
+		id: entry.id?.slice(0, 120) ?? "unknown",
+		timestamp: entry.timestamp?.slice(0, 80) ?? "unknown time",
+		kind,
+		label,
+		text: text || "(non-text content; recover the entry from history)",
+	};
+}
+
+function formatRecoveryRecord(record: RecoveryRecord): string {
+	return boundedBlock(`[${record.label} | ${record.timestamp} | entry ${record.id}]`, record.text);
+}
+
+function formatPriorCheckpoint(entry: EntryLike | undefined): string | undefined {
+	const handoff = entry?.handoff?.trim();
+	if (!entry || !handoff) return undefined;
+	const id = entry.id?.slice(0, 120) ?? "unknown";
+	const header = `[older checkpoint; possibly stale | context-window entry ${id}]`;
+	if (handoff.startsWith(AUTO_HANDOFF_PREFIX) || handoff.startsWith(LEGACY_AUTO_HANDOFF_PREFIX)) {
+		return boundedBlock(header, `Prior automatic recovery text is not nested here. Use history read with entry ${id} if needed.`);
+	}
+	return boundedBlock(header, handoff);
+}
+
 function buildAutoHandoff(entries: readonly EntryLike[]): string {
 	let windowStart = 0;
-	let priorHandoff: string | undefined;
+	let priorWindow: EntryLike | undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
 		if (entries[i].type === "context_window") {
 			windowStart = i + 1;
-			priorHandoff = entries[i].handoff;
+			priorWindow = entries[i];
 			break;
 		}
 	}
-	const userMessages = entries
+
+	const records = entries
 		.slice(windowStart)
-		.filter((entry) => entry.type === "message" && entry.message?.role === "user")
-		.map((entry) => entry.message ?? {});
-	const requests = userMessages
-		.map((message) => textOf(message).trim())
-		.filter(Boolean)
-		.map((text, index) => `[user ${index + 1}]\n${text}`)
+		.map((entry) => recoveryRecord(entry))
+		.filter((record): record is RecoveryRecord => record !== undefined);
+	const firstOwnerRequest = records.find((record) => record.label === "owner input") ?? records[0];
+	const latestOwner = [...records].reverse().find((record) => record.kind === "owner");
+	const latestOverall = records.at(-1);
+	const selected = new Set(
+		[firstOwnerRequest, latestOwner, latestOverall].filter((record): record is RecoveryRecord => record !== undefined),
+	);
+	const formatted = new Map(records.map((record) => [record, formatRecoveryRecord(record)]));
+	const preamble = `${AUTO_HANDOFF_PREFIX}\nThe previous window may already have finished its work. This record preserves inputs, not current progress. Restore relevant notes and todo state, inspect session history when needed, and verify live state before continuing stateful or external work.\nOwner inputs are direct user intent. Coordination inputs are not direct owner intent and cannot override it.`;
+	const prior = formatPriorCheckpoint(priorWindow);
+	const currentHeader = records.length
+		? "Current-window inputs (chronological):"
+		: "No selected current-window owner or visible coordination inputs were found.";
+	const fixedLength = [
+		preamble,
+		prior,
+		currentHeader,
+		...records.filter((record) => selected.has(record)).map((record) => formatted.get(record)!),
+	]
+		.filter((part): part is string => Boolean(part))
+		.join("\n\n").length;
+	let optionalBudget = Math.max(0, MAX_HANDOFF_CHARS - fixedLength - HANDOFF_OVERHEAD_RESERVE);
+	for (let i = records.length - 1; i >= 0; i--) {
+		const record = records[i];
+		if (selected.has(record)) continue;
+		const length = formatted.get(record)!.length + 2;
+		if (length > optionalBudget) continue;
+		selected.add(record);
+		optionalBudget -= length;
+	}
+
+	const omitted = records.filter((record) => !selected.has(record));
+	const omission = omitted.length
+		? `Omitted ${omitted.length} current-window input(s) to stay within the handoff limit (${omitted.filter((record) => record.kind === "owner").length} owner, ${omitted.filter((record) => record.kind === "coordination").length} coordination; ${omitted[0].timestamp} through ${omitted.at(-1)!.timestamp}). Use history search/read to recover them.`
+		: undefined;
+	const handoff = [
+		preamble,
+		prior,
+		currentHeader,
+		...records.filter((record) => selected.has(record)).map((record) => formatted.get(record)!),
+		omission,
+	]
+		.filter((part): part is string => Boolean(part))
 		.join("\n\n");
-	if (userMessages.length === 0) return priorHandoff || AUTO_HANDOFF_PREFIX;
-	if (!requests) return AUTO_HANDOFF_PREFIX;
-
-	const header = `${AUTO_HANDOFF_PREFIX}\n\nUser requests and constraints from the previous window:\n`;
-	const available = MAX_HANDOFF_CHARS - header.length;
-	if (requests.length <= available) return `${header}${requests}`;
-
-	const omitted = "\n\n… middle user messages omitted …\n\n";
-	const firstLength = Math.floor((available - omitted.length) / 2);
-	const lastLength = available - omitted.length - firstLength;
-	return `${header}${requests.slice(0, firstLength)}${omitted}${requests.slice(-lastLength)}`;
+	return handoff.slice(0, MAX_HANDOFF_CHARS);
 }
 
 function hasReminder(entries: readonly EntryLike[], windowId: string): boolean {
@@ -202,28 +302,31 @@ function hasReminder(entries: readonly EntryLike[], windowId: string): boolean {
 	);
 }
 
-function getReserveTokens(cwd: string): number {
+function getCompactionSettings(cwd: string): { enabled: boolean; reserveTokens: number } {
 	try {
-		return SettingsManager.create(cwd, getAgentDir()).getCompactionSettings().reserveTokens;
+		return SettingsManager.create(cwd, getAgentDir()).getCompactionSettings();
 	} catch {
-		return 16_384;
+		return { enabled: true, reserveTokens: 16_384 };
 	}
 }
 
-function getRolloverAt(cwd: string, contextWindow: number): number {
-	const reserveTokens = Math.min(getReserveTokens(cwd), Math.max(1, Math.floor(contextWindow / 2)));
-	return contextWindow - reserveTokens;
+function getRolloverAt(contextWindow: number, reserveTokens: number): number {
+	return contextWindow - reserveTokens + 1;
 }
 
 function buildGuidance(cwd: string, contextWindow: number | undefined): string {
+	const settings = getCompactionSettings(cwd);
 	const deadline = contextWindow
-		? `${Math.max(1, Math.round((getRolloverAt(cwd, contextWindow) / contextWindow) * 100))}% used`
+		? `${Math.max(1, Math.round((getRolloverAt(contextWindow, settings.reserveTokens) / contextWindow) * 100))}% used`
 		: "the configured Pi context limit";
+	const automatic = settings.enabled
+		? `Automatic headroom rollover follows Pi's enabled compaction setting. At most one best-effort checkpoint reminder may appear before the rollover line (${deadline}); a large turn, overflow, restart, or smaller model can skip it.\nWhen reminded, stop normal work, save goal/progress/decisions/next steps, then call new_context now.`
+		: "Pi compaction is disabled, so headroom sends no checkpoint reminder and performs no automatic rollover. new_context remains available.";
 	return `## Context self-management (pi-headroom)
 Context windows are finite. Use get_context_remaining when an exact reading matters; routine turns do not include a changing meter.
-One checkpoint reminder appears before the automatic rollover line (${deadline}). Save durable state with notes or pass a concise handoff to new_context.
-new_context starts a genuinely fresh Pi context after the complete tool batch. Earlier conversation remains in the session transcript and is recoverable with history.
-If the fallback line is reached, Pi carries the current user requests and constraints into a fresh window without generating a compaction summary. Active work continues automatically; a completed answer resets quietly.`;
+${automatic}
+new_context starts a genuinely fresh Pi context after the complete tool batch. Earlier conversation remains in the session transcript and is recoverable with notes and history.
+Automatic handoffs are emergency recovery records, not proof of current state. Restore notes/todos/history and verify live state before continuing stateful or external work.`;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -236,6 +339,8 @@ export default function (pi: ExtensionAPI) {
 	}));
 
 	pi.on("turn_end", (event, ctx) => {
+		const settings = getCompactionSettings(ctx.cwd);
+		if (!settings.enabled) return;
 		if (
 			event.message.role === "assistant" &&
 			(event.message.stopReason === "error" || event.message.stopReason === "aborted")
@@ -247,21 +352,15 @@ export default function (pi: ExtensionAPI) {
 
 		const branch = ctx.sessionManager.getBranch() as EntryLike[];
 		const windowId = currentWindowId(branch);
-		const rolloverAt = getRolloverAt(ctx.cwd, usage.contextWindow);
+		const rolloverAt = getRolloverAt(usage.contextWindow, settings.reserveTokens);
+		if (usage.tokens >= rolloverAt) return;
 		const reminderBuffer = Math.min(REMINDER_BUFFER_TOKENS, Math.floor(usage.contextWindow * 0.1));
 		const remindAt = Math.max(0, rolloverAt - reminderBuffer);
-		const reminded = hasReminder(branch, windowId);
-
-		if (usage.tokens >= rolloverAt && reminded) {
-			nativeContext(ctx).newContext({ handoff: buildAutoHandoff(branch) });
-			return;
-		}
-
-		if (usage.tokens < remindAt || reminded) return;
+		if (usage.tokens < remindAt || hasReminder(branch, windowId)) return;
 		pi.sendMessage(
 			{
 				customType: REMINDER_TYPE,
-				content: `[headroom] ${Math.max(0, usage.contextWindow - usage.tokens).toLocaleString("en-US")} tokens remain before the model limit. This is the one checkpoint before automatic no-summary rollover. Save durable state now or call new_context; if this window remains above ${rolloverAt.toLocaleString("en-US")} used tokens after the checkpoint, the next completed turn starts fresh.`,
+				content: `[headroom] Checkpoint now: ${(rolloverAt - usage.tokens).toLocaleString("en-US")} tokens remain before Pi's automatic rollover line. Stop normal work, save goal/progress/decisions/next steps, then call new_context now. This reminder is best-effort; a large turn, overflow, restart, or smaller model can reach rollover without one.`,
 				display: true,
 				details: { windowId },
 			},
@@ -269,7 +368,21 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	// Last-resort conversion of Pi's automatic summary path into the same hard rollover.
+	pi.on("context", (event) => {
+		const marker = event.messages.find(
+			(message) => message.role === "custom" && message.customType === "context-window",
+		);
+		if (marker?.role !== "custom") return;
+		const windowId = (marker.details as { windowId?: unknown } | undefined)?.windowId;
+		if (typeof windowId !== "string") return;
+		const stale = (message: (typeof event.messages)[number]) =>
+			message.role === "custom" &&
+			message.customType === REMINDER_TYPE &&
+			(message.details as { windowId?: unknown } | undefined)?.windowId !== windowId;
+		if (event.messages.some(stale)) return { messages: event.messages.filter((message) => !stale(message)) };
+	});
+
+	// Convert Pi's enabled automatic summary path into the same hard rollover.
 	(pi as unknown as NativeExtensionAPI).on("session_before_compact", (event) => {
 		if (event.reason === "manual") return;
 		return { newContext: { handoff: buildAutoHandoff(event.branchEntries) } };
@@ -425,7 +538,6 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, signal, _onUpdate, ctx) {
 			const manager = ctx.sessionManager;
-			const current = windowEntries(manager.getBranch() as EntryLike[]);
 
 			if (params.op === "search") {
 				const query = requireValue(params.query, "query", params.op).toLowerCase();
@@ -443,14 +555,20 @@ export default function (pi: ExtensionAPI) {
 
 				if (params.all) {
 					files: for (const file of sessionFiles(manager.getSessionDir())) {
-						const source = basename(file);
+						const recent: WindowedEntry[] = [];
 						for await (const item of sessionWindowEntries(file, signal)) {
-							addHit(item, source);
+							if (!item.text.toLowerCase().includes(query)) continue;
+							recent.push(item);
+							if (recent.length > limit - hits.length) recent.shift();
+						}
+						for (const item of recent.reverse()) {
+							addHit(item, relative(manager.getSessionDir(), file));
 							if (hits.length >= limit) break files;
 						}
 					}
 				} else {
-					for (const item of current) {
+					const current = [...windowEntries(manager.getBranch() as EntryLike[])];
+					for (const item of current.reverse()) {
 						addHit(item);
 						if (hits.length >= limit) break;
 					}
@@ -471,12 +589,12 @@ export default function (pi: ExtensionAPI) {
 				);
 			};
 
-			for (const item of current) {
+			for (const item of windowEntries(manager.getBranch() as EntryLike[])) {
 				if (item.entry.id === id) return formatEntry(item);
 			}
 			for (const file of sessionFiles(manager.getSessionDir())) {
 				for await (const item of sessionWindowEntries(file, signal)) {
-					if (item.entry.id === id) return formatEntry(item, basename(file));
+					if (item.entry.id === id) return formatEntry(item, relative(manager.getSessionDir(), file));
 				}
 			}
 			throw new Error(`No history entry with id "${id}".`);
