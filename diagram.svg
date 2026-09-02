@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="t d">
   <title id="t">pi-headroom flow</title>
-  <desc id="d">The model gets sparse context-budget signals, saves a handoff or notes, calls new_context for a native hard cutover, and recovers earlier conversation from the on-disk transcript.</desc>
+  <desc id="d">The model gets a best-effort context-budget checkpoint, saves a handoff or notes, calls new_context for a native hard cutover, and recovers earlier conversation from the on-disk transcript.</desc>
 
   <style>
     .sans { font-family: Inter, ui-sans-serif, Arial, sans-serif; }
@@ -75,8 +75,8 @@
     <circle cx="104" cy="334" r="15" fill="#3B4A63"/>
     <text class="mono num" x="104" y="339">1</text>
     <text class="sans cardtitle" x="128" y="341">Budget</text>
-    <text class="sans cardbody" x="96" y="390">Stable guidance, then one</text>
-    <text class="sans cardbody" x="96" y="411">checkpoint reminder near</text>
+    <text class="sans cardbody" x="96" y="390">Stable guidance, then a</text>
+    <text class="sans cardbody" x="96" y="411">best-effort checkpoint near</text>
     <text class="sans cardbody" x="96" y="432">the rollover line.</text>
     <rect x="96" y="472" width="122" height="26" rx="13" fill="#1E293B"/>
     <text class="mono chip" x="157" y="489" fill="#91A0B8">SPARSE SIGNAL</text>
