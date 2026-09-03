@@ -459,16 +459,12 @@ function unsupportedMessage(budget: Budget): string {
 }
 
 /** Characters that fit before Pi's automatic line (or the hard limit), capped at the absolute ceiling. */
-function pageChars(ctx: NativeContext): number {
+function requirePage(ctx: NativeContext, offset: number): number {
 	const usage = ctx.getContextUsage();
 	if (!usage || usage.tokens == null) return MAX_HANDOFF_CHARS;
 	const budget = budgetFor(ctx, usage.contextWindow);
 	const line = budget?.enabled && budget.supported ? budget.rolloverAt : usage.contextWindow;
-	return Math.min(MAX_HANDOFF_CHARS, Math.max(0, line - usage.tokens - PAGE_MARGIN_TOKENS) * 4);
-}
-
-function requirePage(ctx: NativeContext, offset: number): number {
-	const chars = pageChars(ctx);
+	const chars = Math.min(MAX_HANDOFF_CHARS, Math.max(0, line - usage.tokens - PAGE_MARGIN_TOKENS) * 4);
 	if (chars < MIN_PAGE_CHARS) {
 		throw new Error(
 			`Too little context remains to read a page safely. Call new_context first, then retry with offset ${offset}.`,
