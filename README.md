@@ -11,7 +11,7 @@ Pi owns the persisted boundary. Posthorse owns the policy: stable window guidanc
 ## Requirements
 
 - Node `>=22.19.0`.
-- The `fitchmultz/pi` fork at revision `PI_FORK_REVISION` or newer. Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
+- The `fitchmultz/pi` fork at commit `ff62a780422ce997c75e44cbd7d932593a24edc0` ([PR #6](https://github.com/fitchmultz/pi/pull/6)) or newer. Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
 - Official, unpatched Pi is unsupported. Posthorse detects it at session start and stops with a clear error instead of degrading.
 
 ## Install
@@ -21,7 +21,7 @@ Build the fork once:
 ```bash
 git clone https://github.com/fitchmultz/pi.git
 cd pi
-git checkout PI_FORK_REVISION
+git checkout ff62a780422ce997c75e44cbd7d932593a24edc0
 npm install --ignore-scripts
 npm run build
 ```
