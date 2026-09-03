@@ -186,17 +186,13 @@ function flattenEntry(entry: EntryLike): string | undefined {
 			if (message.excludeFromContext === true) return "[bashExecution] (excluded from model context by Pi)";
 			return `[bashExecution] $ ${message.command ?? ""}\n${message.output ?? ""}`;
 		}
-		return [`[${message.role ?? "message"}] ${textOf(message)}`, imageSummary(imagesOf(message.content))]
-			.filter(Boolean)
-			.join("\n");
+		return `[${message.role ?? "message"}] ${[textOf(message), imageSummary(imagesOf(message.content))].filter(Boolean).join("\n")}`;
 	}
 	if (entry.type === "compaction" || entry.type === "branch_summary") {
 		return `[${entry.type}] ${entry.summary ?? ""}`;
 	}
 	if (entry.type === "custom_message") {
-		return [`[custom:${entry.customType ?? "unknown"}] ${textOf({ content: entry.content })}`, imageSummary(imagesOf(entry.content))]
-			.filter(Boolean)
-			.join("\n");
+		return `[custom:${entry.customType ?? "unknown"}] ${[textOf({ content: entry.content }), imageSummary(imagesOf(entry.content))].filter(Boolean).join("\n")}`;
 	}
 	if (entry.type === "context_window") {
 		return `[context_window] ${entry.handoff ? `Handoff: ${entry.handoff}` : "No handoff"}`;
@@ -698,9 +694,11 @@ export default function (pi: ExtensionAPI) {
 					const content = requireValue(params.content, "content", params.op);
 					const path = safeJoin(relative);
 					mkdirSync(dirname(path), { recursive: true });
-					// One O_APPEND write per record, newline-terminated and separated from any existing text,
-					// so concurrent Pi processes appending to a shared note never merge records.
-					const separator = existsSync(path) && statSync(path).size > 0 ? "\n" : "";
+					// One O_APPEND write per newline-terminated record, so concurrent Pi processes appending to a
+					// shared note never merge records. The separator only matters after a write that left no trailing
+					// newline; racing on that check costs at most one blank line.
+					const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+					const separator = existing && !existing.endsWith("\n") ? "\n" : "";
 					appendFileSync(path, `${separator}${content.replace(/\n?$/, "\n")}`);
 					return textResult(`Appended to .pi/notes/${relative}`);
 				}
