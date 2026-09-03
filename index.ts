@@ -100,6 +100,16 @@ function textResult(text: string) {
 	return { content: [{ type: "text" as const, text }], details: undefined };
 }
 
+// A linked git worktree's `.git` is a file: "gitdir: <main>/.git/worktrees/<name>".
+// Notes then belong to the main checkout so every worktree shares them and they outlive the worktree.
+function notesRoot(cwd: string): string {
+	try {
+		const main = readFileSync(join(cwd, ".git"), "utf8").match(/^gitdir:\s*(.+)[\\/]\.git[\\/]worktrees[\\/][^\\/]+\s*$/m)?.[1];
+		if (main) return main;
+	} catch {}
+	return cwd;
+}
+
 function requireValue(value: string | undefined, name: string, op: string): string {
 	if (!value) throw new Error(`"${name}" is required for op "${op}".`);
 	return value;
@@ -436,7 +446,7 @@ export default function (pi: ExtensionAPI) {
 		name: "notes",
 		label: "Notes",
 		description:
-			"Persistent notes in .pi/notes/ that survive context resets. Ops: list, read, write (create/replace), append, search (case-insensitive substring over note lines).",
+			"Persistent notes in .pi/notes/ that survive context resets. Ops: list, read, write (create/replace), append, search (case-insensitive substring over note lines). Inside a linked git worktree the notes belong to the main checkout.",
 		promptSnippet: "save and recall durable state that survives context resets",
 		promptGuidelines: [
 			"Use notes for durable state too large for a new_context handoff",
@@ -452,7 +462,7 @@ export default function (pi: ExtensionAPI) {
 			query: Type.Optional(Type.String({ description: "Substring to find in notes (search)" })),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const dir = join(ctx.cwd, ".pi", "notes");
+			const dir = join(notesRoot(ctx.cwd), ".pi", "notes");
 			const safeJoin = (path: string) => {
 				const relative = normalize(path.replace(/^[/\\]+/, ""));
 				if (relative === ".." || relative.startsWith(`..${sep}`) || isAbsolute(relative)) {

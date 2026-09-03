@@ -46,7 +46,7 @@ Headroom follows Pi's `compaction.enabled` setting. Disabling automatic compacti
 - `notes({ op, ... })`: `list`, `read`, `write`, `append`, `search`
 - `history({ op, ... })`: `search`, `read`; results include native window IDs, and long reads return the next character offset
 
-Notes live in `.pi/notes/`. Add that directory to `.gitignore` when the project should not track them.
+Notes live in `.pi/notes/` of the main checkout; a linked git worktree shares that notebook instead of getting one that dies with the worktree. Add the directory to `.gitignore` when the project should not track it.
 
 ## Develop
 

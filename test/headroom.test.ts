@@ -1,5 +1,5 @@
 import { strict as assert } from "node:assert";
-import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -264,6 +264,32 @@ test("context filtering removes only reminders from an older window", () => {
 	const filtered = handlers.get("context")!({ messages: [marker, old, other, current] }, context) as { messages: unknown[] };
 	assert.deepEqual(filtered.messages, [marker, other, current]);
 	assert.equal(handlers.get("context")!({ messages: [marker, other, current] }, context), undefined);
+});
+
+test("notes from a linked git worktree belong to the main checkout", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-notes-test-"));
+	try {
+		const main = join(dir, "main");
+		const worktree = join(dir, "wt");
+		const plain = join(dir, "plain");
+		mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
+		mkdirSync(worktree);
+		writeFileSync(join(worktree, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
+		mkdirSync(join(plain, ".git"), { recursive: true });
+		const { tools, context } = setup();
+		const notes = (cwd: string, params: Record<string, unknown>) =>
+			tools.get("notes")!.execute("id", params, new AbortController().signal, () => {}, { ...context, cwd });
+
+		await notes(worktree, { op: "write", path: "state.md", content: "from worktree" });
+		assert.equal(readFileSync(join(main, ".pi", "notes", "state.md"), "utf8"), "from worktree");
+		assert.equal(existsSync(join(worktree, ".pi")), false);
+		assert.equal(toolText(await notes(worktree, { op: "list" })), "state.md");
+
+		await notes(plain, { op: "write", path: "state.md", content: "from plain repo" });
+		assert.equal(readFileSync(join(plain, ".pi", "notes", "state.md"), "utf8"), "from plain repo");
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });
 
 test("history reads current entries without opening every archived session", async () => {
