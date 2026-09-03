@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Resolves `notes` to the main checkout when Pi runs inside a linked git worktree, so every worktree of a repository shares one notebook and notes outlive the worktree.
+
 ## 0.3.0
 
 - Rebuilds automatic handoffs as bounded recovery records that retain direct user inputs, `ask_question` outcomes, visible coordination, and a clearly stale older checkpoint without inferring state from assistant prose.
