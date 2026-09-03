@@ -604,6 +604,10 @@ test("small-context configurations are unsupported; larger ones derive honest bu
 		const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, large) as { systemPrompt: string };
 		assert.match(guidance.systemPrompt, /rollover line \(84% used\)/);
 		assert.match(guidance.systemPrompt, /best available native estimate/);
+		// The owner's primary model: gpt-5.6-sol, 272K window with a 64K reserve → line at 208,001 (76%).
+		const sol = usageContext(base, 272_000, 205_000, 64_000);
+		assert.match((handlers.get("before_agent_start")!({ systemPrompt: "base" }, sol) as { systemPrompt: string }).systemPrompt, /rollover line \(76% used\)/);
+		assert.match(toolText(await run(tools, "get_context_remaining", {}, sol)), /^≈3,001 tokens until automatic rollover \(line at 208,001\); ≈67,000 tokens until the hard context limit/);
 		const remaining = toolText(await run(tools, "get_context_remaining", {}, usageContext(base, 100_000, 36_000, 64_000)));
 		assert.match(remaining, /^≈1 tokens until automatic rollover \(line at 36,001\); ≈64,000 tokens until the hard context limit \(36,000\/100,000 used, 36%\)\. Best available native estimate\.$/);
 		const unknown = toolText(await run(tools, "get_context_remaining", {}, { ...base, getContextUsage: () => undefined }));
