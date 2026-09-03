@@ -1,24 +1,26 @@
 {
-	"name": "pi-headroom",
-	"version": "0.3.1",
+	"name": "pi-posthorse",
+	"version": "0.4.0",
 	"type": "module",
-	"description": "Native no-summary context windows for a personal patched Pi, with sparse budget reminders, handoffs, notes, and history.",
-	"keywords": ["pi-package", "pi-extension", "context", "headroom"],
+	"description": "Posthorse: fresh context, same journey. Native no-summary context windows for the fitchmultz/pi fork, with sparse budget reminders, handoffs, notes, and history.",
+	"keywords": ["pi-package", "pi-extension", "context", "posthorse", "rollover"],
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/fitchmultz/pi-headroom.git"
+		"url": "git+https://github.com/fitchmultz/pi-posthorse.git"
 	},
 	"license": "MIT",
+	"files": ["index.ts"],
 	"engines": {
 		"node": ">=22.19.0"
 	},
 	"pi": {
 		"extensions": ["./index.ts"],
-		"image": "https://raw.githubusercontent.com/fitchmultz/pi-headroom/main/diagram.png"
+		"image": "https://raw.githubusercontent.com/fitchmultz/pi-posthorse/main/diagram.png"
 	},
 	"scripts": {
 		"check": "tsc --noEmit",
-		"test": "node --test test/headroom.test.ts"
+		"test": "node --test test/posthorse.test.ts",
+		"prepublishOnly": "npm test && npm run check"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",

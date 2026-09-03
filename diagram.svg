@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1080" viewBox="0 0 1600 1080" role="img" aria-labelledby="t d">
-  <title id="t">pi-headroom flow</title>
+  <title id="t">Posthorse flow</title>
   <desc id="d">Two paths reach the same native Pi context-window boundary: the model checkpoints on purpose and calls new_context, or Pi's enabled automatic compaction becomes a no-summary rollover with a bounded recovery record. The fresh window restores notes, todos, and history from the complete on-disk transcript.</desc>
 
   <style>
@@ -58,8 +58,8 @@
   <rect width="1600" height="1080" fill="url(#bloom)"/>
 
   <!-- title block -->
-  <text class="mono eyebrow" x="72" y="84">PI EXTENSION — MODEL-MANAGED CONTEXT WINDOWS</text>
-  <text class="sans title" x="72" y="134">pi-headroom</text>
+  <text class="mono eyebrow" x="72" y="84">PI EXTENSION — FRESH CONTEXT. SAME JOURNEY.</text>
+  <text class="sans title" x="72" y="134">Posthorse</text>
   <text class="sans subtitle" x="72" y="170">One native hard cutover, reached by the model on purpose or by Pi as a fallback — never an automatic lossy summary.</text>
 
   <!-- tool surface (top right) -->
@@ -123,9 +123,9 @@
     <text class="sans cardbody" x="96" y="388">the prefix stays cacheable.</text>
     <text class="sans cardbody" x="96" y="410">One best-effort reminder before</text>
     <text class="sans cardbody" x="96" y="432">the line, never at or past it.</text>
-    <text class="sans cardbody" x="96" y="454">Exact reading on request.</text>
+    <text class="sans cardbody" x="96" y="454">Native estimate on request.</text>
     <rect x="96" y="472" width="232" height="26" rx="13" fill="#12253F"/>
-    <text class="mono chip" x="212" y="489" fill="#60A5FA">ONCE PER WINDOW · BEST-EFFORT</text>
+    <text class="mono chip" x="212" y="489" fill="#60A5FA">ONCE PER WINDOW + BUDGET</text>
   </g>
 
   <!-- A2: Save -->
@@ -156,7 +156,7 @@
     <text class="sans cardbody" x="96" y="668">Pi's enabled compaction fires</text>
     <text class="sans cardbody" x="96" y="690">on threshold, overflow, or a</text>
     <text class="sans cardbody" x="96" y="712">restart into a smaller model.</text>
-    <text class="sans cardbody" x="96" y="734">session_before_compact answers</text>
+    <text class="sans cardbody" x="96" y="734">Posthorse claims the trigger</text>
     <text class="sans cardbody" x="96" y="756">with newContext — no summary.</text>
     <text class="sans cardbody" x="96" y="778">Manual /compact is untouched.</text>
     <rect x="96" y="796" width="216" height="26" rx="13" fill="#3A2A10"/>
@@ -172,11 +172,11 @@
     </g>
     <text class="sans cardtitle" x="484" y="625">Recovery record</text>
     <text class="sans cardbody" x="448" y="668">Owner inputs, ask_question</text>
-    <text class="sans cardbody" x="448" y="690">answers, visible coordination:</text>
-    <text class="sans cardbody" x="448" y="712">labeled, chronological, ≤ 20k</text>
-    <text class="sans cardbody" x="448" y="734">chars. Older checkpoint marked</text>
-    <text class="sans cardbody" x="448" y="756">possibly stale. No assistant</text>
-    <text class="sans cardbody" x="448" y="778">prose is treated as state.</text>
+    <text class="sans cardbody" x="448" y="690">answers, visible coordination,</text>
+    <text class="sans cardbody" x="448" y="712">unconsumed tool batch: labeled,</text>
+    <text class="sans cardbody" x="448" y="734">chronological, ≤ 20k chars.</text>
+    <text class="sans cardbody" x="448" y="756">Older checkpoint marked stale.</text>
+    <text class="sans cardbody" x="448" y="778">Assistant prose is not state.</text>
     <rect x="448" y="796" width="184" height="26" rx="13" fill="#3A2A10"/>
     <text class="mono chip" x="540" y="813" fill="#F59E0B">EMERGENCY INPUT RECORD</text>
   </g>

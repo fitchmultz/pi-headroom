@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # Known-good fitchmultz/pi revision for the integration job; keep in step with the README.
+  PI_FORK_REF: 0291ae42151fe0f77bacb13182186039be92eaea
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: ["22.19", "24"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run check
+      - run: npm audit
+      - run: npm pack --dry-run
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: pi-posthorse
+      - uses: actions/checkout@v5
+        with:
+          repository: fitchmultz/pi
+          ref: ${{ env.PI_FORK_REF }}
+          path: pi
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22.19"
+      - run: npm ci
+        working-directory: pi-posthorse
+      - run: npm ci --ignore-scripts
+        working-directory: pi
+      - run: npm run build
+        working-directory: pi
+      - run: PI_FORK=../pi scripts/integration.sh
+        working-directory: pi-posthorse
