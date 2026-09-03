@@ -696,7 +696,7 @@ export default function (pi: ExtensionAPI) {
 					mkdirSync(dirname(path), { recursive: true });
 					// One O_APPEND write per newline-terminated record, so concurrent Pi processes appending to a
 					// shared note never merge records. The separator only matters after a write that left no trailing
-					// newline; racing on that check costs at most one blank line.
+					// newline; a torn read of another process's in-flight append costs at most one blank line.
 					const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
 					const separator = existing && !existing.endsWith("\n") ? "\n" : "";
 					appendFileSync(path, `${separator}${content.replace(/\n?$/, "\n")}`);

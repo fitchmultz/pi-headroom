@@ -775,8 +775,10 @@ test("appends from concurrent Pi processes never merge records", async () => {
 		);
 		const lines = readFileSync(join(dir, ".pi", "notes", "shared.md"), "utf8").split("\n");
 		assert.equal(lines.pop(), "", "file ends with a newline");
-		assert.equal(lines.length, 400);
-		assert.ok(lines.every((line) => line === "A".repeat(300) || line === "B".repeat(300)), "every record is intact");
+		// A torn read of an in-flight append may add a blank separator line; records themselves never merge.
+		const records = lines.filter(Boolean);
+		assert.equal(records.length, 400);
+		assert.ok(records.every((line) => line === "A".repeat(300) || line === "B".repeat(300)), "every record is intact");
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
