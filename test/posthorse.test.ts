@@ -3,8 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { type ExtensionAPI, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import headroom from "../index.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import posthorse from "../index.ts";
 
 type Handler = (event: Record<string, unknown>, context: TestContext) => unknown;
 type Tool = {
@@ -14,7 +14,10 @@ type Tool = {
 		signal: AbortSignal,
 		onUpdate: () => void,
 		context: TestContext,
-	): Promise<{ content: Array<{ type: string; text: string }>; newContext?: { handoff?: string } }>;
+	): Promise<{
+		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+		newContext?: { handoff?: string };
+	}>;
 };
 type TestContext = {
 	cwd: string;
@@ -23,7 +26,8 @@ type TestContext = {
 		getBranch(): Record<string, unknown>[];
 		getSessionDir(): string;
 	};
-	getContextUsage(): { tokens: number; contextWindow: number; percent: number };
+	getContextUsage(): { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+	getCompactionSettings(): { enabled: boolean; reserveTokens: number };
 	newContext(options?: { handoff?: string }): void;
 };
 
@@ -47,24 +51,25 @@ function setup() {
 			messages.push(message);
 		},
 	} as unknown as ExtensionAPI;
-	headroom(api);
+	posthorse(api);
 	const context: TestContext = {
 		cwd: process.cwd(),
 		model: { contextWindow: 100_000 },
 		sessionManager: { getBranch: () => [], getSessionDir: () => tmpdir() },
 		getContextUsage: () => ({ tokens: 1000, contextWindow: 100_000, percent: 1 }),
+		getCompactionSettings: () => ({ enabled: true, reserveTokens: 16_384 }),
 		newContext: () => {},
 	};
 	return { handlers, tools, messages, context };
 }
 
-function toolText(result: { content: Array<{ text: string }> }): string {
-	return result.content.map((part) => part.text).join("\n");
+function toolText(result: { content: Array<{ text?: string }> }): string {
+	return result.content.map((part) => part.text ?? "").join("\n");
 }
 
 function automaticHandoff(handlers: Map<string, Handler>, context: TestContext, branchEntries: Record<string, unknown>[]) {
 	return (
-		handlers.get("session_before_compact")!(
+		handlers.get("session_before_auto_compact")!(
 			{ reason: "threshold", branchEntries },
 			context,
 		) as { newContext: { handoff: string } }
@@ -77,7 +82,7 @@ test("new_context returns an atomic handoff and automatic rollover builds a reco
 		.get("new_context")!
 		.execute("id", { handoff: "continue here" }, new AbortController().signal, () => {}, context);
 	assert.deepEqual(result.newContext, { handoff: "continue here" });
-	assert.equal(handlers.get("session_before_compact")!({ reason: "manual" }, context), undefined);
+	assert.equal(handlers.has("session_before_compact"), false, "manual /compact is left to Pi");
 
 	const handoff = automaticHandoff(handlers, context, [
 		{ type: "message", id: "user", timestamp: "2026-09-02T10:00:00Z", message: { role: "user", content: "keep working on the fix" } },
@@ -171,14 +176,14 @@ test("automatic recovery includes successful ask_question cancellations and excl
 });
 
 test("budget policy sends one best-effort reminder below the line and lets Pi own rollover", () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-test-"));
 	try {
+		// A project file that disagrees with Pi's effective policy must be ignored: Pi decides trust, not Posthorse.
 		mkdirSync(join(dir, ".pi"));
-		writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ compaction: { reserveTokens: 64_000 } }));
+		writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ compaction: { enabled: false, reserveTokens: 1 } }));
 		const { handlers, messages } = setup();
 		const contextWindow = 100_000;
-		const reserve = SettingsManager.create(dir, getAgentDir()).getCompactionSettings().reserveTokens;
-		assert.equal(reserve, 64_000);
+		const reserve = 64_000;
 		const threshold = contextWindow - reserve;
 		const rolloverAt = threshold + 1;
 		const remindAt = rolloverAt - Math.min(32_000, Math.floor(contextWindow * 0.1));
@@ -190,6 +195,7 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 			model: { contextWindow },
 			sessionManager: { getBranch: () => branch, getSessionDir: () => dir },
 			getContextUsage: () => ({ tokens, contextWindow, percent: (tokens / contextWindow) * 100 }),
+			getCompactionSettings: () => ({ enabled: true, reserveTokens: reserve }),
 			newContext: (options) => rollovers.push(options ?? {}),
 		};
 
@@ -208,7 +214,8 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		assert.equal(messages.length, 1);
 		assert.match(messages[0].content, /Checkpoint now/);
 		assert.match(messages[0].content, /call new_context now/);
-		branch.push({ type: "custom_message", customType: "headroom-reminder", details: messages[0].details });
+		assert.deepEqual(messages[0].details, { windowId: "window-2", contextWindow, reserveTokens: reserve });
+		branch.push({ type: "custom_message", customType: "posthorse-reminder", details: messages[0].details });
 
 		tokens = threshold;
 		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
@@ -216,7 +223,7 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		branch.pop();
 		messages.length = 0;
 		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
-		assert.equal(messages.length, 1, "headroom still offers a checkpoint at equality");
+		assert.equal(messages.length, 1, "Posthorse still offers a checkpoint at equality");
 
 		messages.length = 0;
 		tokens = rolloverAt;
@@ -224,50 +231,61 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		assert.equal(messages.length, 0, "Pi owns the first token that actually triggers rollover");
 		tokens += 1_000;
 		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
-		assert.equal(messages.length, 0, "headroom also stays out of Pi's over-threshold path");
+		assert.equal(messages.length, 0, "Posthorse also stays out of Pi's over-threshold path");
 		assert.equal(rollovers.length, 0);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
 });
 
-test("disabled Pi compaction disables automatic headroom behavior but not new_context", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-disabled-test-"));
-	try {
-		mkdirSync(join(dir, ".pi"));
-		writeFileSync(join(dir, ".pi", "settings.json"), JSON.stringify({ compaction: { enabled: false } }));
-		const { handlers, messages, tools } = setup();
-		const context: TestContext = {
-			cwd: dir,
-			model: { contextWindow: 100_000 },
-			sessionManager: { getBranch: () => [], getSessionDir: () => dir },
-			getContextUsage: () => ({ tokens: 99_000, contextWindow: 100_000, percent: 99 }),
-			newContext: () => {},
-		};
-		const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, context) as { systemPrompt: string };
-		assert.match(guidance.systemPrompt, /Pi compaction is disabled/);
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
-		assert.equal(messages.length, 0);
-		const result = await tools.get("new_context")!.execute("id", {}, new AbortController().signal, () => {}, context);
-		assert.deepEqual(result.newContext, { handoff: undefined });
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
-	}
+test("disabled Pi compaction disables automatic Posthorse behavior but not new_context", async () => {
+	const { handlers, messages, tools } = setup();
+	const context: TestContext = {
+		...setup().context,
+		getContextUsage: () => ({ tokens: 99_000, contextWindow: 100_000, percent: 99 }),
+		getCompactionSettings: () => ({ enabled: false, reserveTokens: 16_384 }),
+	};
+	const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, context) as { systemPrompt: string };
+	assert.match(guidance.systemPrompt, /Pi compaction is disabled/);
+	assert.match(guidance.systemPrompt, /Context self-management \(Posthorse\)/);
+	handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+	assert.equal(messages.length, 0);
+	const remaining = toolText(await tools.get("get_context_remaining")!.execute("id", {}, new AbortController().signal, () => {}, context));
+	assert.match(remaining, /Automatic rollover is disabled/);
+	assert.match(remaining, /1,000 tokens until the hard context limit/);
+	const result = await tools.get("new_context")!.execute("id", {}, new AbortController().signal, () => {}, context);
+	assert.deepEqual(result.newContext, { handoff: undefined });
 });
 
-test("context filtering removes only reminders from an older window", () => {
+test("context filtering removes reminders from an older window or a different budget, legacy ids included", () => {
 	const { handlers, context } = setup();
 	const marker = { role: "custom", customType: "context-window", content: "new", details: { windowId: "new" } };
-	const current = { role: "custom", customType: "headroom-reminder", content: "current", details: { windowId: "new" } };
-	const old = { role: "custom", customType: "headroom-reminder", content: "old", details: { windowId: "old" } };
+	const current = {
+		role: "custom",
+		customType: "posthorse-reminder",
+		content: "current",
+		details: { windowId: "new", contextWindow: 100_000, reserveTokens: 16_384 },
+	};
+	const legacyCurrent = { role: "custom", customType: "headroom-reminder", content: "legacy current", details: { windowId: "new" } };
+	const old = { role: "custom", customType: "posthorse-reminder", content: "old", details: { windowId: "old", contextWindow: 100_000, reserveTokens: 16_384 } };
+	const legacyOld = { role: "custom", customType: "headroom-reminder", content: "legacy old", details: { windowId: "old" } };
+	const otherModel = { role: "custom", customType: "posthorse-reminder", content: "smaller model", details: { windowId: "new", contextWindow: 50_000, reserveTokens: 16_384 } };
+	const otherReserve = { role: "custom", customType: "posthorse-reminder", content: "other reserve", details: { windowId: "new", contextWindow: 100_000, reserveTokens: 64_000 } };
 	const other = { role: "custom", customType: "intercom_message", content: "keep" };
-	const filtered = handlers.get("context")!({ messages: [marker, old, other, current] }, context) as { messages: unknown[] };
-	assert.deepEqual(filtered.messages, [marker, other, current]);
-	assert.equal(handlers.get("context")!({ messages: [marker, other, current] }, context), undefined);
+	const filtered = handlers.get("context")!(
+		{ messages: [marker, old, legacyOld, otherModel, otherReserve, other, current, legacyCurrent] },
+		context,
+	) as { messages: unknown[] };
+	assert.deepEqual(filtered.messages, [marker, other, current, legacyCurrent]);
+	assert.equal(handlers.get("context")!({ messages: [marker, other, current, legacyCurrent] }, context), undefined);
+	// Before any rollover the window is "initial"; a reminder computed for another model size is still stale.
+	const initial = { role: "custom", customType: "posthorse-reminder", content: "initial", details: { windowId: "initial", contextWindow: 100_000, reserveTokens: 16_384 } };
+	const filteredInitial = handlers.get("context")!({ messages: [otherModel, initial] }, context) as { messages: unknown[] };
+	assert.deepEqual(filteredInitial.messages, [initial]);
 });
 
 test("notes from a linked git worktree belong to the main checkout", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-notes-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-notes-test-"));
 	try {
 		const main = join(dir, "main");
 		const worktree = join(dir, "wt");
@@ -293,21 +311,18 @@ test("notes from a linked git worktree belong to the main checkout", async () =>
 });
 
 test("history reads current entries without opening every archived session", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-history-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-history-test-"));
 	try {
 		mkdirSync(join(dir, "unrelated.jsonl"));
-		const { tools } = setup();
+		const { tools, context: base } = setup();
 		const context: TestContext = {
-			cwd: process.cwd(),
-			model: { contextWindow: 100_000 },
+			...base,
 			sessionManager: {
 				getBranch: () => [
 					{ type: "message", id: "current", parentId: null, timestamp: "1", message: { role: "user", content: "keep me" } },
 				],
 				getSessionDir: () => dir,
 			},
-			getContextUsage: () => ({ tokens: 1000, contextWindow: 100_000, percent: 1 }),
-			newContext: () => {},
 		};
 
 		const reads = await Promise.all(
@@ -322,7 +337,7 @@ test("history reads current entries without opening every archived session", asy
 });
 
 test("all-session history recurses and returns newest matching entries first", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-headroom-recursive-history-test-"));
+	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-recursive-history-test-"));
 	try {
 		const nested = join(dir, "subagents");
 		mkdirSync(nested);
@@ -339,11 +354,10 @@ test("all-session history recurses and returns newest matching entries first", a
 		);
 		utimesSync(oldFile, new Date(1_000), new Date(1_000));
 		utimesSync(newFile, new Date(2_000), new Date(2_000));
-		const { tools } = setup();
+		const { tools, context: base } = setup();
 		let mayReadCurrentBranch = false;
 		const context: TestContext = {
-			cwd: process.cwd(),
-			model: { contextWindow: 100_000 },
+			...base,
 			sessionManager: {
 				getBranch: () => {
 					assert.ok(mayReadCurrentBranch, "all-session search must not normalize the current branch");
@@ -351,8 +365,6 @@ test("all-session history recurses and returns newest matching entries first", a
 				},
 				getSessionDir: () => dir,
 			},
-			getContextUsage: () => ({ tokens: 1000, contextWindow: 100_000, percent: 1 }),
-			newContext: () => {},
 		};
 		const search = await tools.get("history")!.execute(
 			"id",
@@ -380,7 +392,7 @@ test("all-session history recurses and returns newest matching entries first", a
 });
 
 test("history searches normalized text and reports native window ids", async () => {
-	const { tools } = setup();
+	const { tools, context: base } = setup();
 	const branch = [
 		{ type: "message", id: "needle-only-in-id", parentId: null, timestamp: "1", message: { role: "user", content: "plain" } },
 		{ type: "message", id: "before", parentId: "needle-only-in-id", timestamp: "2", message: { role: "user", content: "needle before" } },
@@ -389,11 +401,8 @@ test("history searches normalized text and reports native window ids", async () 
 		{ type: "message", id: "long", parentId: "after", timestamp: "5", message: { role: "user", content: `${"x".repeat(20_100)}needle tail` } },
 	];
 	const context: TestContext = {
-		cwd: process.cwd(),
-		model: { contextWindow: 100_000 },
+		...base,
 		sessionManager: { getBranch: () => branch, getSessionDir: () => join(tmpdir(), "missing") },
-		getContextUsage: () => ({ tokens: 1000, contextWindow: 100_000, percent: 1 }),
-		newContext: () => {},
 	};
 	const result = await tools.get("history")!.execute(
 		"id",
