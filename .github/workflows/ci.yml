@@ -7,7 +7,7 @@ on:
 
 env:
   # Known-good fitchmultz/pi revision for the integration job; keep in step with the README.
-  PI_FORK_REF: ff62a780422ce997c75e44cbd7d932593a24edc0
+  PI_FORK_REF: 0291ae42151fe0f77bacb13182186039be92eaea
 
 jobs:
   test:

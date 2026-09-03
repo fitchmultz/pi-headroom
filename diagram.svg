@@ -125,7 +125,7 @@
     <text class="sans cardbody" x="96" y="432">the line, never at or past it.</text>
     <text class="sans cardbody" x="96" y="454">Native estimate on request.</text>
     <rect x="96" y="472" width="232" height="26" rx="13" fill="#12253F"/>
-    <text class="mono chip" x="212" y="489" fill="#60A5FA">ONCE PER WINDOW · BEST-EFFORT</text>
+    <text class="mono chip" x="212" y="489" fill="#60A5FA">ONCE PER WINDOW + BUDGET</text>
   </g>
 
   <!-- A2: Save -->

@@ -28,6 +28,7 @@ const MAX_RECOVERY_RECORD_CHARS = 4_000;
 const HANDOFF_OVERHEAD_RESERVE = 1_000;
 const PAGE_MARGIN_TOKENS = 1_000;
 const MIN_PAGE_CHARS = 1_000;
+const ESTIMATED_IMAGE_CHARS = 4_800;
 /** A window must hold the largest handoff (~5,000 tokens) plus equal working room below Pi's line. */
 const MIN_USABLE_TOKENS = Math.ceil(MAX_HANDOFF_CHARS / 4) * 2;
 const REMINDER_TYPE = "posthorse-reminder";
@@ -45,13 +46,14 @@ type NativeContext = {
 	newContext(options?: { handoff?: string }): void;
 	getCompactionSettings(): CompactionPolicy;
 	getContextUsage(): ContextUsage | undefined;
+	getSystemPrompt(): string;
 };
 
 type NativeExtensionAPI = {
 	on(
 		event: "session_before_auto_compact",
 		handler: (
-			event: { reason: "overflow" | "threshold"; branchEntries: EntryLike[] },
+			event: { reason: "overflow" | "threshold"; branchEntries: EntryLike[]; pendingMessages?: MessageLike[] },
 			ctx: unknown,
 		) => { newContext: { handoff?: string } } | undefined,
 	): void;
@@ -60,6 +62,7 @@ type NativeExtensionAPI = {
 type ImageLike = { type: "image"; data: string; mimeType: string };
 type MessageLike = {
 	role?: string;
+	stopReason?: string;
 	content?: unknown;
 	toolName?: string;
 	toolCallId?: string;
@@ -102,7 +105,11 @@ type Budget = {
 
 function nativeContext<T>(ctx: T): T & NativeContext {
 	const candidate = ctx as T & Partial<NativeContext>;
-	if (typeof candidate.newContext !== "function" || typeof candidate.getCompactionSettings !== "function") {
+	if (
+		typeof candidate.newContext !== "function" ||
+		typeof candidate.getCompactionSettings !== "function" ||
+		typeof candidate.getSystemPrompt !== "function"
+	) {
 		throw new Error("Posthorse requires the fitchmultz/pi fork with native context windows (see README).");
 	}
 	return candidate as T & NativeContext;
@@ -127,6 +134,14 @@ function imageSummary(images: ImageLike[]): string {
 	return `[${images.length} image${images.length === 1 ? "" : "s"}: ${types}]`;
 }
 
+function safeJsonStringify(value: unknown): string {
+	try {
+		return JSON.stringify(value) ?? "undefined";
+	} catch {
+		return "[unserializable]";
+	}
+}
+
 function textOf(message: MessageLike): string {
 	if (typeof message.content === "string") return message.content;
 	if (!Array.isArray(message.content)) return "";
@@ -136,7 +151,7 @@ function textOf(message: MessageLike): string {
 			const block = part as { type?: string; text?: string; thinking?: string; name?: string; arguments?: unknown };
 			if (block.type === "text") return block.text ?? "";
 			if (block.type === "thinking") return block.thinking ?? "";
-			if (block.type === "toolCall") return `${block.name ?? "tool"} ${JSON.stringify(block.arguments ?? {})}`;
+			if (block.type === "toolCall") return `${block.name ?? "tool"} ${safeJsonStringify(block.arguments ?? {})}`;
 			return "";
 		})
 		.filter(Boolean)
@@ -264,8 +279,9 @@ function excerpt(text: string, limit: number): string {
 	return `${text.slice(0, head)}${marker}${text.slice(text.length - (limit - marker.length - head))}`;
 }
 
-function boundedBlock(header: string, text: string, limit = MAX_RECOVERY_RECORD_CHARS): string {
-	return `${header}\n${excerpt(text, Math.max(0, limit - header.length - 1))}`;
+function boundedBlock(header: string, text: string, limit: number): string {
+	const textLimit = Math.max(0, limit - header.length - 1);
+	return textLimit ? `${header}\n${excerpt(text, textLimit)}` : header;
 }
 
 function recoveryRecord(entry: EntryLike): RecoveryRecord | undefined {
@@ -306,19 +322,19 @@ function recoveryRecord(entry: EntryLike): RecoveryRecord | undefined {
 	};
 }
 
-function formatRecoveryRecord(record: RecoveryRecord): string {
-	return boundedBlock(`[${record.label} | ${record.timestamp} | entry ${record.id}]`, record.text);
+function formatRecoveryRecord(record: RecoveryRecord, limit: number): string {
+	return boundedBlock(`[${record.label} | ${record.timestamp} | entry ${record.id}]`, record.text, limit);
 }
 
-function formatPriorCheckpoint(entry: EntryLike | undefined): string | undefined {
+function formatPriorCheckpoint(entry: EntryLike | undefined, limit: number): string | undefined {
 	const handoff = entry?.handoff?.trim();
 	if (!entry || !handoff) return undefined;
 	const id = entry.id?.slice(0, 120) ?? "unknown";
 	const header = `[older checkpoint; possibly stale | context-window entry ${id}]`;
 	if (handoff.startsWith(AUTO_HANDOFF_PREFIX) || handoff.startsWith(LEGACY_AUTO_HANDOFF_PREFIX)) {
-		return boundedBlock(header, `Prior automatic recovery text is not nested here. Use history read with entry ${id} if needed.`);
+		return boundedBlock(header, `Prior automatic recovery text is not nested here. Use history read with entry ${id} if needed.`, limit);
 	}
-	return boundedBlock(header, handoff);
+	return boundedBlock(header, handoff, limit);
 }
 
 /**
@@ -326,44 +342,53 @@ function formatPriorCheckpoint(entry: EntryLike | undefined): string | undefined
  * its completed results (and non-message entries). Pi can roll over right after tools finish, so the
  * result that triggered the rollover would otherwise vanish before any model saw it.
  */
-function unconsumedToolBatch(entries: readonly EntryLike[]): Array<{ header: string; text: string }> {
+function unconsumedToolBatch(
+	entries: readonly EntryLike[],
+): { callId: string; blocks: Array<{ header: string; text: string }> } | undefined {
 	const results: EntryLike[] = [];
 	let call: EntryLike | undefined;
 	for (let i = entries.length - 1; i >= 0 && !call; i--) {
 		const entry = entries[i];
 		const role = entry.type === "message" ? entry.message?.role : undefined;
-		if (role === "toolResult") results.unshift(entry);
-		else if (role === "assistant") call = entry;
+		if (role === "toolResult") {
+			results.unshift(entry);
+		} else if (role === "assistant") {
+			const invalid =
+				entry.message?.stopReason === "error" ||
+				entry.message?.stopReason === "aborted" ||
+				entry.message?.stopReason === "length";
+			if (invalid) {
+				if (results.length) return undefined;
+			} else {
+				call = entry;
+			}
+		}
 	}
-	if (!call || !results.length) return [];
+	if (!call || !results.length) return undefined;
 	const calls = Array.isArray(call.message?.content)
 		? (call.message.content as Array<{ type?: string; id?: string; name?: string; arguments?: unknown }>).filter(
 				(block) => block?.type === "toolCall",
 			)
 		: [];
-	const blocks: Array<{ header: string; text: string }> = [];
-	for (const result of results) {
+	const blocks = results.map((result) => {
 		const message = result.message ?? {};
 		const matching = calls.find((block) => block.id === message.toolCallId);
-		const name = message.toolName ?? matching?.name ?? "tool";
-		const resultId = result.id ?? "unknown";
-		blocks.push({
-			header: `[tool ${name} call | entry ${call.id ?? "unknown"}]`,
-			text: JSON.stringify(matching?.arguments ?? {}),
-		});
+		const name = (message.toolName ?? matching?.name ?? "tool").slice(0, 80);
+		const resultId = (result.id ?? "unknown").slice(0, 120);
 		const images = imageSummary(imagesOf(message.content));
-		blocks.push({
-			header: `[tool ${name} ${message.isError ? "error" : "result"} | entry ${resultId}]`,
-			text:
-				[textOf(message).trim(), images && `${images} — recover with history read id ${resultId}`]
-					.filter(Boolean)
-					.join("\n") || "(empty result)",
-		});
-	}
-	return blocks;
+		const output =
+			[textOf(message).trim(), images && `${images} — recover with history read id ${resultId}`]
+				.filter(Boolean)
+				.join("\n") || "(empty result)";
+		return {
+			header: `[${message.isError ? "error" : "result"} entry ${resultId}]`,
+			text: `${output}\n\nTool: ${name}\nCall arguments: ${safeJsonStringify(matching?.arguments ?? {})}`,
+		};
+	});
+	return { callId: (call.id ?? "unknown").slice(0, 120), blocks };
 }
 
-function buildAutoHandoff(entries: readonly EntryLike[]): string {
+function buildAutoHandoff(entries: readonly EntryLike[], maxChars: number): string {
 	let windowStart = 0;
 	let priorWindow: EntryLike | undefined;
 	for (let i = entries.length - 1; i >= 0; i--) {
@@ -384,34 +409,83 @@ function buildAutoHandoff(entries: readonly EntryLike[]): string {
 	const selected = new Set(
 		[firstOwnerRequest, latestOwner, latestOverall].filter((record): record is RecoveryRecord => record !== undefined),
 	);
-	const formatted = new Map(records.map((record) => [record, formatRecoveryRecord(record)]));
 	const preamble = `${AUTO_HANDOFF_PREFIX}\nThe previous window may already have finished its work. This record preserves inputs, not current progress. Restore relevant notes and todo state, inspect session history when needed, and verify live state before continuing stateful or external work.\nOwner inputs are direct user intent. Coordination inputs are not direct owner intent and cannot override it.`;
-	const prior = formatPriorCheckpoint(priorWindow);
 	const currentHeader = records.length
 		? "Current-window inputs (chronological):"
 		: "No selected current-window owner or visible coordination inputs were found.";
+	const joinedLength = (parts: Array<string | undefined>) =>
+		parts.filter((part): part is string => Boolean(part)).join("\n\n").length;
+
+	const toolBatch = unconsumedToolBatch(current);
+	const batchHeader = toolBatch
+		? `Unconsumed tool batch (completed after the last assistant response; no model has seen these results). Tool-call entry ${toolBatch.callId}:`
+		: undefined;
+	const minimumParts = [
+		preamble,
+		formatPriorCheckpoint(priorWindow, 0),
+		currentHeader,
+		...records.filter((record) => selected.has(record)).map((record) => formatRecoveryRecord(record, 0)),
+		batchHeader,
+	];
+	let headerBudget = Math.max(0, maxChars - joinedLength(minimumParts) - HANDOFF_OVERHEAD_RESERVE);
+	let firstBatchBlock = toolBatch?.blocks.length ?? 0;
+	while (firstBatchBlock > 0) {
+		const length = toolBatch!.blocks[firstBatchBlock - 1].header.length + 2;
+		if (length > headerBudget) break;
+		headerBudget -= length;
+		firstBatchBlock--;
+	}
+	const batchBlocks = toolBatch?.blocks.slice(firstBatchBlock) ?? [];
+	const batchOmission = firstBatchBlock
+		? `Omitted ${firstBatchBlock} earlier tool result(s) whose headers could not fit. Use history read with tool-call entry ${toolBatch!.callId}, then history search/read to recover them.`
+		: undefined;
+	const bareBatch = batchHeader
+		? [batchHeader, batchOmission, ...batchBlocks.map((block) => block.header)]
+				.filter((part): part is string => Boolean(part))
+				.join("\n\n")
+		: undefined;
+	const fixedCount = selected.size + (priorWindow?.handoff?.trim() ? 1 : 0);
+	const fixedBudget = Math.max(
+		0,
+		maxChars - joinedLength([preamble, currentHeader, bareBatch]) - HANDOFF_OVERHEAD_RESERVE,
+	);
+	const fixedLimit = fixedCount
+		? Math.min(MAX_RECOVERY_RECORD_CHARS, Math.floor(fixedBudget / fixedCount))
+		: MAX_RECOVERY_RECORD_CHARS;
+	const prior = formatPriorCheckpoint(priorWindow, fixedLimit);
+	const formatted = new Map(
+		records.map((record) => [
+			record,
+			formatRecoveryRecord(record, selected.has(record) ? fixedLimit : MAX_RECOVERY_RECORD_CHARS),
+		]),
+	);
 	const fixedParts = () => [
 		preamble,
 		prior,
 		currentHeader,
 		...records.filter((record) => selected.has(record)).map((record) => formatted.get(record)!),
 	];
-	const joinedLength = (parts: Array<string | undefined>) =>
-		parts.filter((part): part is string => Boolean(part)).join("\n\n").length;
 
-	// The unconsumed batch is mandatory; each block shares the remaining budget evenly, keeping every entry id.
-	const batchBlocks = unconsumedToolBatch(current);
 	let batch: string | undefined;
-	if (batchBlocks.length) {
-		const available = Math.max(0, MAX_HANDOFF_CHARS - joinedLength(fixedParts()) - HANDOFF_OVERHEAD_RESERVE);
-		const perBlock = Math.max(200, Math.min(MAX_RECOVERY_RECORD_CHARS, Math.floor(available / batchBlocks.length)));
+	if (batchHeader && bareBatch) {
+		const availableText = Math.max(
+			0,
+			maxChars -
+				joinedLength([...fixedParts(), bareBatch]) -
+				HANDOFF_OVERHEAD_RESERVE -
+				batchBlocks.length,
+		);
+		const perBlock = Math.min(MAX_RECOVERY_RECORD_CHARS, Math.floor(availableText / batchBlocks.length));
 		batch = [
-			"Unconsumed tool batch (completed after the last assistant response; no model has seen these results):",
-			...batchBlocks.map((block) => boundedBlock(block.header, block.text, perBlock)),
-		].join("\n\n");
+			batchHeader,
+			batchOmission,
+			...batchBlocks.map((block) => (perBlock ? `${block.header}\n${excerpt(block.text, perBlock)}` : block.header)),
+		]
+			.filter((part): part is string => Boolean(part))
+			.join("\n\n");
 	}
 
-	let optionalBudget = Math.max(0, MAX_HANDOFF_CHARS - joinedLength([...fixedParts(), batch]) - HANDOFF_OVERHEAD_RESERVE);
+	let optionalBudget = Math.max(0, maxChars - joinedLength([...fixedParts(), batch]) - HANDOFF_OVERHEAD_RESERVE);
 	for (let i = records.length - 1; i >= 0; i--) {
 		const record = records[i];
 		if (selected.has(record)) continue;
@@ -425,11 +499,10 @@ function buildAutoHandoff(entries: readonly EntryLike[]): string {
 	const omission = omitted.length
 		? `Omitted ${omitted.length} current-window input(s) to stay within the handoff limit (${omitted.filter((record) => record.kind === "owner").length} owner, ${omitted.filter((record) => record.kind === "coordination").length} coordination; ${omitted[0].timestamp} through ${omitted.at(-1)!.timestamp}). Use history search/read to recover them.`
 		: undefined;
-	const handoff = [...fixedParts(), omission, batch].filter((part): part is string => Boolean(part)).join("\n\n");
-	return handoff.slice(0, MAX_HANDOFF_CHARS);
+	return [...fixedParts(), omission, batch].filter((part): part is string => Boolean(part)).join("\n\n");
 }
 
-/** Legacy reminders carry only windowId; they match on it alone. */
+/** Legacy reminders carry only windowId; they match on it alone until the model changes. */
 function reminderMatches(details: unknown, fingerprint: ReminderFingerprint): boolean {
 	const stored = (details ?? {}) as Partial<ReminderFingerprint>;
 	return (
@@ -439,10 +512,37 @@ function reminderMatches(details: unknown, fingerprint: ReminderFingerprint): bo
 	);
 }
 
+function reminderIsStale(
+	customType: unknown,
+	details: unknown,
+	fingerprint: ReminderFingerprint,
+	branch: readonly EntryLike[],
+): boolean {
+	if (!reminderMatches(details, fingerprint)) return true;
+	const stored = (details ?? {}) as Partial<ReminderFingerprint>;
+	if (customType !== LEGACY_REMINDER_TYPE || stored.contextWindow !== undefined || stored.reserveTokens !== undefined) {
+		return false;
+	}
+	let reminderIndex = -1;
+	for (let i = 0; i < branch.length; i++) {
+		const entry = branch[i];
+		if (
+			entry.type === "custom_message" &&
+			entry.customType === LEGACY_REMINDER_TYPE &&
+			((entry.details ?? {}) as Partial<ReminderFingerprint>).windowId === stored.windowId
+		) {
+			reminderIndex = i;
+		}
+	}
+	return reminderIndex !== -1 && branch.slice(reminderIndex + 1).some((entry) => entry.type === "model_change");
+}
+
 function hasReminder(entries: readonly EntryLike[], fingerprint: ReminderFingerprint): boolean {
 	return entries.some(
 		(entry) =>
-			entry.type === "custom_message" && isReminderType(entry.customType) && reminderMatches(entry.details, fingerprint),
+			entry.type === "custom_message" &&
+			isReminderType(entry.customType) &&
+			!reminderIsStale(entry.customType, entry.details, fingerprint, entries),
 	);
 }
 
@@ -453,18 +553,42 @@ function budgetFor(ctx: NativeContext, contextWindow = ctx.model?.contextWindow)
 	return { contextWindow, reserveTokens, enabled, usable, rolloverAt: usable + 1, supported: !enabled || usable >= MIN_USABLE_TOKENS };
 }
 
+/** Half the fresh capacity after prompt/tool/input overhead remains for continued work. */
+function freshPayloadChars(ctx: NativeContext, toolTokens: number, pendingMessages: readonly MessageLike[] = []): number {
+	const contextWindow = ctx.model?.contextWindow;
+	if (!contextWindow || contextWindow <= 0) return MAX_HANDOFF_CHARS;
+	const budget = budgetFor(ctx, contextWindow);
+	const line = budget?.enabled && budget.supported ? budget.rolloverAt : contextWindow;
+	const promptTokens = Math.ceil(ctx.getSystemPrompt().length / 4);
+	const pendingTokens = pendingMessages.reduce(
+		(total, message) => total + Math.ceil(textOf(message).length / 4) + imagesOf(message.content).length * (ESTIMATED_IMAGE_CHARS / 4),
+		0,
+	);
+	return Math.min(
+		MAX_HANDOFF_CHARS,
+		Math.max(0, Math.floor((line - PAGE_MARGIN_TOKENS - promptTokens - toolTokens - pendingTokens) / 2)) * 4,
+	);
+}
+
 function unsupportedMessage(budget: Budget): string {
 	const n = (value: number) => value.toLocaleString("en-US");
-	return `Posthorse: unsupported configuration. The model's context window (${n(budget.contextWindow)} tokens) minus Pi's compaction.reserveTokens (${n(budget.reserveTokens)}) leaves ${n(budget.usable)} usable tokens; Posthorse needs at least ${n(MIN_USABLE_TOKENS)}. Automatic rollover and checkpoint reminders are off for this model. Lower compaction.reserveTokens in Pi settings or use a larger-context model. new_context remains available.`;
+	return `Posthorse: unsupported configuration. The model's context window (${n(budget.contextWindow)} tokens) minus Pi's compaction.reserveTokens (${n(budget.reserveTokens)}) leaves ${n(budget.usable)} usable tokens; Posthorse needs at least ${n(MIN_USABLE_TOKENS)}. Automatic rollover and checkpoint reminders are off for this model. Lower compaction.reserveTokens in Pi settings or use a larger-context model. new_context remains available with a model-aware handoff limit.`;
 }
 
 /** Characters that fit before Pi's automatic line (or the hard limit), capped at the absolute ceiling. */
-function requirePage(ctx: NativeContext, offset: number): number {
+function requirePage(ctx: NativeContext, offset: number, imageCount: number, toolTokens: number): number {
 	const usage = ctx.getContextUsage();
-	if (!usage || usage.tokens == null) return MAX_HANDOFF_CHARS;
-	const budget = budgetFor(ctx, usage.contextWindow);
-	const line = budget?.enabled && budget.supported ? budget.rolloverAt : usage.contextWindow;
-	const chars = Math.min(MAX_HANDOFF_CHARS, Math.max(0, line - usage.tokens - PAGE_MARGIN_TOKENS) * 4);
+	let chars: number;
+	if (!usage || usage.tokens == null) {
+		chars = Math.max(0, freshPayloadChars(ctx, toolTokens) - imageCount * ESTIMATED_IMAGE_CHARS);
+	} else {
+		const budget = budgetFor(ctx, usage.contextWindow);
+		const line = budget?.enabled && budget.supported ? budget.rolloverAt : usage.contextWindow;
+		chars = Math.min(
+			MAX_HANDOFF_CHARS,
+			Math.max(0, line - usage.tokens - PAGE_MARGIN_TOKENS) * 4 - imageCount * ESTIMATED_IMAGE_CHARS,
+		);
+	}
 	if (chars < MIN_PAGE_CHARS) {
 		throw new Error(
 			`Too little context remains to read a page safely. Call new_context first, then retry with offset ${offset}.`,
@@ -496,6 +620,22 @@ Automatic handoffs are emergency recovery records, not proof of current state. R
 }
 
 export default function (pi: ExtensionAPI) {
+	const activeToolTokens = () => {
+		const active = new Set(pi.getActiveTools());
+		return pi
+			.getAllTools()
+			.filter((tool) => active.has(tool.name))
+			.reduce(
+				(total, tool) =>
+					total +
+					Math.ceil(
+						safeJsonStringify({ name: tool.name, description: tool.description ?? "", parameters: tool.parameters })
+							.length / 4,
+					),
+				0,
+			);
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		nativeContext(ctx);
 	});
@@ -529,8 +669,8 @@ export default function (pi: ExtensionAPI) {
 			reserveTokens: budget.reserveTokens,
 		};
 		if (usage.tokens >= budget.rolloverAt) return;
-		const reminderBuffer = Math.min(REMINDER_BUFFER_TOKENS, Math.floor(budget.contextWindow * 0.1));
-		const remindAt = Math.max(0, budget.rolloverAt - reminderBuffer);
+		const reminderBuffer = Math.min(REMINDER_BUFFER_TOKENS, Math.floor(budget.usable * 0.1));
+		const remindAt = budget.rolloverAt - reminderBuffer;
 		if (usage.tokens < remindAt || hasReminder(branch, fingerprint)) return;
 		pi.sendMessage(
 			{
@@ -550,23 +690,32 @@ export default function (pi: ExtensionAPI) {
 		);
 		const windowId = marker?.role === "custom" ? (marker.details as { windowId?: unknown } | undefined)?.windowId : "initial";
 		if (typeof windowId !== "string") return;
-		const budget = budgetFor(nativeContext(ctx));
+		const native = nativeContext(ctx);
+		const budget = budgetFor(native);
+		const branch = ctx.sessionManager.getBranch() as EntryLike[];
 		const fingerprint: ReminderFingerprint = {
 			windowId,
 			contextWindow: budget?.contextWindow,
 			reserveTokens: budget?.reserveTokens,
 		};
 		const stale = (message: (typeof event.messages)[number]) =>
-			message.role === "custom" && isReminderType(message.customType) && !reminderMatches(message.details, fingerprint);
+			message.role === "custom" &&
+			isReminderType(message.customType) &&
+			reminderIsStale(message.customType, message.details, fingerprint, branch);
 		if (event.messages.some(stale)) return { messages: event.messages.filter((message) => !stale(message)) };
 	});
 
 	// Claim Pi's automatic threshold/overflow trigger with a fresh window: no summary, no summarization auth.
 	(pi as unknown as NativeExtensionAPI).on("session_before_auto_compact", (event, ctx) => {
-		const budget = budgetFor(nativeContext(ctx));
+		const native = nativeContext(ctx);
+		const budget = budgetFor(native);
 		// An unsupported budget would roll over every turn; leave Pi's own behavior in place instead.
 		if (budget && !budget.supported) return undefined;
-		return { newContext: { handoff: buildAutoHandoff(event.branchEntries) } };
+		const limit = freshPayloadChars(native, activeToolTokens(), event.pendingMessages);
+		if (limit < MIN_PAGE_CHARS) return undefined;
+		const handoff = buildAutoHandoff(event.branchEntries, limit);
+		if (handoff.length > limit) return undefined;
+		return { newContext: { handoff } };
 	});
 
 	pi.registerTool({
@@ -587,12 +736,19 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_id, { handoff }, _signal, _onUpdate, ctx) {
-			nativeContext(ctx);
+			const native = nativeContext(ctx);
+			const trimmed = handoff?.trim() || undefined;
+			const limit = freshPayloadChars(native, activeToolTokens());
+			if (trimmed && trimmed.length > limit) {
+				throw new Error(
+					`Handoff is too large for the active model (${trimmed.length.toLocaleString("en-US")} characters; limit ${limit.toLocaleString("en-US")}). Save fuller state in notes, then retry with a shorter handoff or no handoff.`,
+				);
+			}
 			return {
 				...textResult(
 					"Requested a fresh Pi context after this complete tool batch succeeds. Earlier conversation stays in session history.",
 				),
-				newContext: { handoff: handoff?.trim() || undefined },
+				newContext: { handoff: trimmed },
 			};
 		},
 	});
@@ -672,7 +828,7 @@ export default function (pi: ExtensionAPI) {
 					if (offset && offset >= text.length) {
 						throw new Error(`Offset ${offset} is past the end of ${relative} (${text.length} chars).`);
 					}
-					const end = Math.min(text.length, offset + requirePage(nativeContext(ctx), offset));
+					const end = Math.min(text.length, offset + requirePage(nativeContext(ctx), offset, 0, activeToolTokens()));
 					const more =
 						end < text.length ? `\n[chars ${offset}-${end} of ${text.length}; continue with offset ${end}]` : "";
 					return textResult(`${text.slice(offset, end)}${more}`);
@@ -707,9 +863,10 @@ export default function (pi: ExtensionAPI) {
 					for (const file of files) {
 						for (const [index, line] of readFileSync(file, "utf8").split("\n").entries()) {
 							if (hits.length >= 20) break;
-							const match = line.toLowerCase().indexOf(query);
+							const trimmed = line.trim();
+							const match = trimmed.toLowerCase().indexOf(query);
 							if (match !== -1) {
-								hits.push(`${file.slice(dir.length + 1)}:${index + 1}: ${excerptAround(line.trim(), match, 50, 200)}`);
+								hits.push(`${file.slice(dir.length + 1)}:${index + 1}: ${excerptAround(trimmed, match, 50, 200)}`);
 							}
 						}
 					}
@@ -781,7 +938,10 @@ export default function (pi: ExtensionAPI) {
 				if (offset >= item.text.length) {
 					throw new Error(`Offset ${offset} is past the end of history entry "${id}" (${item.text.length} chars).`);
 				}
-				const end = Math.min(item.text.length, offset + requirePage(nativeContext(ctx), offset));
+				const end = Math.min(
+					item.text.length,
+					offset + requirePage(nativeContext(ctx), offset, offset === 0 ? item.images.length : 0, activeToolTokens()),
+				);
 				const more = end < item.text.length ? `\nMore remains; call history read with id "${id}" and offset ${end}.` : "";
 				// Stored images ride along with the first page only.
 				return textResult(

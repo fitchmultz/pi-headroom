@@ -29,12 +29,14 @@ type TestContext = {
 	};
 	getContextUsage(): { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
 	getCompactionSettings(): { enabled: boolean; reserveTokens: number };
+	getSystemPrompt(): string;
 	newContext(options?: { handoff?: string }): void;
 };
 
 function setup() {
 	const handlers = new Map<string, Handler>();
 	const tools = new Map<string, Tool>();
+	const toolDefinitions: Array<{ name: string; description?: string; parameters?: unknown }> = [];
 	const messages: Array<{
 		customType?: string;
 		content: string;
@@ -45,12 +47,15 @@ function setup() {
 		on(event: string, handler: Handler) {
 			handlers.set(event, handler);
 		},
-		registerTool(tool: Tool & { name: string }) {
+		registerTool(tool: Tool & { name: string; description?: string; parameters?: unknown }) {
 			tools.set(tool.name, tool);
+			toolDefinitions.push(tool);
 		},
 		sendMessage(message: (typeof messages)[number]) {
 			messages.push(message);
 		},
+		getActiveTools: () => [...tools.keys()],
+		getAllTools: () => toolDefinitions,
 	} as unknown as ExtensionAPI;
 	posthorse(api);
 	const context: TestContext = {
@@ -59,6 +64,7 @@ function setup() {
 		sessionManager: { getBranch: () => [], getSessionDir: () => tmpdir() },
 		getContextUsage: () => ({ tokens: 1000, contextWindow: 100_000, percent: 1 }),
 		getCompactionSettings: () => ({ enabled: true, reserveTokens: 16_384 }),
+		getSystemPrompt: () => "You are a test assistant.",
 		newContext: () => {},
 	};
 	return { handlers, tools, messages, context };
@@ -97,9 +103,7 @@ function automaticHandoff(handlers: Map<string, Handler>, context: TestContext, 
 
 test("new_context returns an atomic handoff and automatic rollover builds a recovery record", async () => {
 	const { handlers, tools, context } = setup();
-	const result = await tools
-		.get("new_context")!
-		.execute("id", { handoff: "continue here" }, new AbortController().signal, () => {}, context);
+	const result = await run(tools, "new_context", { handoff: "continue here" }, context);
 	assert.deepEqual(result.newContext, { handoff: "continue here" });
 	assert.equal(handlers.has("session_before_compact"), false, "manual /compact is left to Pi");
 
@@ -205,7 +209,7 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		const reserve = 64_000;
 		const threshold = contextWindow - reserve;
 		const rolloverAt = threshold + 1;
-		const remindAt = rolloverAt - Math.min(32_000, Math.floor(contextWindow * 0.1));
+		const remindAt = 32_401; // Last 3,600 tokens of the 36,000 usable tokens.
 		let tokens = remindAt - 1;
 		const branch: Record<string, unknown>[] = [{ type: "context_window", id: "window-2" }];
 		const rollovers: Array<{ handoff?: string }> = [];
@@ -215,21 +219,22 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 			sessionManager: { getBranch: () => branch, getSessionDir: () => dir },
 			getContextUsage: () => ({ tokens, contextWindow, percent: (tokens / contextWindow) * 100 }),
 			getCompactionSettings: () => ({ enabled: true, reserveTokens: reserve }),
+			getSystemPrompt: () => "You are a test assistant.",
 			newContext: (options) => rollovers.push(options ?? {}),
 		};
 
 		handlers.get("session_start")!({}, context);
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+		turnEnd(handlers, context);
 		assert.equal(messages.length, 0, "no reminder below the band");
 		tokens = remindAt;
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "toolUse" }, toolResults: [{ toolName: "new_context" }] }, context);
+		turnEnd(handlers, context, [{ toolName: "new_context" }]);
 		assert.equal(messages.length, 0);
 		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "error" }, toolResults: [] }, context);
 		assert.equal(messages.length, 0);
 		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "aborted" }, toolResults: [] }, context);
 		assert.equal(messages.length, 0);
 
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+		turnEnd(handlers, context);
 		assert.equal(messages.length, 1);
 		assert.match(messages[0].content, /Checkpoint now/);
 		assert.match(messages[0].content, /call new_context now/);
@@ -237,19 +242,19 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		branch.push({ type: "custom_message", customType: "posthorse-reminder", details: messages[0].details });
 
 		tokens = threshold;
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+		turnEnd(handlers, context);
 		assert.equal(messages.length, 1, "Pi does not roll at exact threshold equality");
 		branch.pop();
 		messages.length = 0;
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+		turnEnd(handlers, context);
 		assert.equal(messages.length, 1, "Posthorse still offers a checkpoint at equality");
 
 		messages.length = 0;
 		tokens = rolloverAt;
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+		turnEnd(handlers, context);
 		assert.equal(messages.length, 0, "Pi owns the first token that actually triggers rollover");
 		tokens += 1_000;
-		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+		turnEnd(handlers, context);
 		assert.equal(messages.length, 0, "Posthorse also stays out of Pi's over-threshold path");
 		assert.equal(rollovers.length, 0);
 	} finally {
@@ -257,22 +262,31 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 	}
 });
 
+test("a large reserve does not send checkpoint reminders in a fresh window", () => {
+	const { handlers, messages, context: base } = setup();
+	for (const tokens of [1000, 9000]) turnEnd(handlers, usageContext(base, 400_000, tokens, 390_000));
+	assert.equal(messages.length, 0, "a fresh 10K usable window must not immediately checkpoint again");
+	turnEnd(handlers, usageContext(base, 400_000, 9001, 390_000));
+	assert.equal(messages.length, 1);
+	assert.match(messages[0].content, /1,000 tokens remain/);
+});
+
 test("disabled Pi compaction disables automatic Posthorse behavior but not new_context", async () => {
-	const { handlers, messages, tools } = setup();
+	const { handlers, messages, tools, context: base } = setup();
 	const context: TestContext = {
-		...setup().context,
+		...base,
 		getContextUsage: () => ({ tokens: 99_000, contextWindow: 100_000, percent: 99 }),
 		getCompactionSettings: () => ({ enabled: false, reserveTokens: 16_384 }),
 	};
 	const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, context) as { systemPrompt: string };
 	assert.match(guidance.systemPrompt, /Pi compaction is disabled/);
 	assert.match(guidance.systemPrompt, /Context self-management \(Posthorse\)/);
-	handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, context);
+	turnEnd(handlers, context);
 	assert.equal(messages.length, 0);
-	const remaining = toolText(await tools.get("get_context_remaining")!.execute("id", {}, new AbortController().signal, () => {}, context));
+	const remaining = toolText(await run(tools, "get_context_remaining", {}, context));
 	assert.match(remaining, /Automatic rollover is disabled/);
 	assert.match(remaining, /1,000 tokens until the hard context limit/);
-	const result = await tools.get("new_context")!.execute("id", {}, new AbortController().signal, () => {}, context);
+	const result = await run(tools, "new_context", {}, context);
 	assert.deepEqual(result.newContext, { handoff: undefined });
 });
 
@@ -303,32 +317,6 @@ test("context filtering removes reminders from an older window or a different bu
 	assert.deepEqual(filteredInitial.messages, [initial]);
 });
 
-test("notes from a linked git worktree belong to the main checkout", async () => {
-	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-notes-test-"));
-	try {
-		const main = join(dir, "main");
-		const worktree = join(dir, "wt");
-		const plain = join(dir, "plain");
-		mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
-		mkdirSync(worktree);
-		writeFileSync(join(worktree, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
-		mkdirSync(join(plain, ".git"), { recursive: true });
-		const { tools, context } = setup();
-		const notes = (cwd: string, params: Record<string, unknown>) =>
-			tools.get("notes")!.execute("id", params, new AbortController().signal, () => {}, { ...context, cwd });
-
-		await notes(worktree, { op: "write", path: "state.md", content: "from worktree" });
-		assert.equal(readFileSync(join(main, ".pi", "notes", "state.md"), "utf8"), "from worktree");
-		assert.equal(existsSync(join(worktree, ".pi")), false);
-		assert.equal(toolText(await notes(worktree, { op: "list" })), "state.md");
-
-		await notes(plain, { op: "write", path: "state.md", content: "from plain repo" });
-		assert.equal(readFileSync(join(plain, ".pi", "notes", "state.md"), "utf8"), "from plain repo");
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
-	}
-});
-
 test("history reads current entries without opening every archived session", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-history-test-"));
 	try {
@@ -345,9 +333,7 @@ test("history reads current entries without opening every archived session", asy
 		};
 
 		const reads = await Promise.all(
-			Array.from({ length: 5 }, () =>
-				tools.get("history")!.execute("id", { op: "read", id: "current" }, new AbortController().signal, () => {}, context),
-			),
+			Array.from({ length: 5 }, () => run(tools, "history", { op: "read", id: "current" }, context)),
 		);
 		for (const result of reads) assert.match(toolText(result), /keep me/);
 	} finally {
@@ -456,34 +442,33 @@ test("history searches normalized text and reports native window ids", async () 
 
 test("a persisted legacy headroom-reminder still deduplicates, and a model switch invalidates it", () => {
 	const { handlers, messages, context: base } = setup();
-	// 100K window, 16,384 reserve: line at 83,617; reminder band starts 10,000 tokens below it.
 	const branch: Record<string, unknown>[] = [
 		{ type: "context_window", id: "window-2" },
 		{ type: "custom_message", id: "legacy", customType: "headroom-reminder", details: { windowId: "window-2" } },
 	];
-	const context = { ...usageContext(base, 100_000, 75_000), sessionManager: { getBranch: () => branch, getSessionDir: () => tmpdir() } };
+	const context = { ...usageContext(base, 100_000, 76_000), sessionManager: { getBranch: () => branch, getSessionDir: () => tmpdir() } };
 	turnEnd(handlers, context);
 	assert.equal(messages.length, 0, "legacy reminder in the same window counts");
 
-	branch.pop();
-	turnEnd(handlers, context);
-	assert.equal(messages.length, 1);
-	assert.equal(messages[0].customType, "posthorse-reminder");
-	assert.deepEqual(messages[0].details, { windowId: "window-2", contextWindow: 100_000, reserveTokens: 16_384 });
-	branch.push({ type: "custom_message", id: "current", customType: "posthorse-reminder", details: messages[0].details });
-	turnEnd(handlers, context);
-	assert.equal(messages.length, 1, "one reminder per window and budget");
-
-	// Same window, larger model: the stored reminder was computed for another budget and must not suppress the new one.
+	branch.push({ type: "model_change", id: "switch", provider: "test", modelId: "larger" });
 	const switched = { ...context, ...usageContext(base, 200_000, 175_000), sessionManager: context.sessionManager };
 	turnEnd(handlers, switched);
-	assert.equal(messages.length, 2);
-	assert.deepEqual(messages[1].details, { windowId: "window-2", contextWindow: 200_000, reserveTokens: 16_384 });
+	assert.equal(messages.length, 1);
+	assert.deepEqual(messages[0].details, { windowId: "window-2", contextWindow: 200_000, reserveTokens: 16_384 });
+	branch.push({ type: "custom_message", id: "current", customType: "posthorse-reminder", details: messages[0].details });
+	turnEnd(handlers, switched);
+	assert.equal(messages.length, 1, "one reminder per window and budget");
+
+	const marker = { role: "custom", customType: "context-window", content: "new", details: { windowId: "window-2" } };
+	const legacy = { role: "custom", customType: "headroom-reminder", content: "legacy", details: { windowId: "window-2" } };
+	const current = { role: "custom", customType: "posthorse-reminder", content: "current", details: messages[0].details };
+	const filtered = handlers.get("context")!({ messages: [marker, legacy, current] }, switched) as { messages: unknown[] };
+	assert.deepEqual(filtered.messages, [marker, current]);
 });
 
 test("new_context beside a failed sibling tool does not suppress the reminder", () => {
 	const { handlers, messages, context: base } = setup();
-	const context = usageContext(base, 100_000, 75_000);
+	const context = usageContext(base, 100_000, 76_000);
 	turnEnd(handlers, context, [{ toolName: "new_context" }, { toolName: "bash", isError: true }]);
 	assert.equal(messages.length, 1, "Pi will not commit the boundary, so the checkpoint reminder still applies");
 	messages.length = 0;
@@ -517,20 +502,72 @@ test("automatic handoff carries only the trailing unconsumed tool batch, with en
 	const handoff = automaticHandoff(handlers, context, batch);
 	assert.ok(handoff.length <= 20_000);
 	assert.match(handoff, /Unconsumed tool batch \(completed after the last assistant response; no model has seen these results\)/);
-	assert.match(handoff, /\[tool bash call \| entry assistant-1\]\n\{"command":"npm test"\}/);
-	assert.match(handoff, /\[tool bash result \| entry result-1\]\n3 tests failed FAILURE DETAIL/);
+	assert.match(handoff, /Tool-call entry assistant-1/);
+	assert.match(handoff, /\[result entry result-1\]\n3 tests failed FAILURE DETAIL/);
+	assert.match(handoff, /Call arguments: \{"command":"npm test"\}/);
 	assert.match(handoff, /middle omitted[\s\S]*FAILURE TAIL/);
-	assert.match(handoff, /\[tool read error \| entry result-2\]\nENOENT missing.txt/);
-	assert.match(handoff, /\[tool screenshot result \| entry result-3\]\n\[1 image: image\/png\] — recover with history read id result-3/);
+	assert.match(handoff, /\[error entry result-2\]\nENOENT missing.txt/);
+	assert.match(handoff, /\[result entry result-3\]\n\[1 image: image\/png\] — recover with history read id result-3/);
 	assert.doesNotMatch(handoff, /ASSISTANT PROSE|QUJDREVG/);
 	assert.ok(handoff.indexOf("entry result-1") < handoff.indexOf("entry result-2"), "results keep their order");
 
+	const errored = automaticHandoff(handlers, context, [
+		...batch,
+		{ type: "message", id: "assistant-error", timestamp: "6", message: { role: "assistant", stopReason: "error", content: "" } },
+	]);
+	assert.match(errored, /Unconsumed tool batch/);
+	assert.match(errored, /entry result-3/);
+
+	const truncatedCall = automaticHandoff(handlers, context, [
+		...batch,
+		{
+			type: "message",
+			id: "assistant-length",
+			timestamp: "6",
+			message: {
+				role: "assistant",
+				stopReason: "length",
+				content: [{ type: "toolCall", id: "truncated-call", name: "write", arguments: { path: "secret" } }],
+			},
+		},
+		{
+			type: "message",
+			id: "truncated-result",
+			timestamp: "7",
+			message: { role: "toolResult", toolCallId: "truncated-call", toolName: "write", isError: true, content: "not executed" },
+		},
+	]);
+	assert.doesNotMatch(truncatedCall, /Unconsumed tool batch|truncated-result|entry result-3/);
+
 	const consumed = automaticHandoff(handlers, context, [
 		...batch,
-		{ type: "message", id: "assistant-2", timestamp: "6", message: { role: "assistant", content: "All done." } },
+		{ type: "message", id: "assistant-2", timestamp: "6", message: { role: "assistant", stopReason: "stop", content: "All done." } },
 	]);
 	assert.doesNotMatch(consumed, /Unconsumed tool batch|FAILURE DETAIL|ENOENT/);
 	assert.match(consumed, /run the checks/);
+
+	const calls = Array.from({ length: 300 }, (_, index) => ({
+		type: "toolCall",
+		id: `stress-call-${index}`,
+		name: "read",
+		arguments: { path: `${index}.txt` },
+	}));
+	const resultIds = calls.map((_, index) => `00000000-0000-7000-8000-${index.toString().padStart(12, "0")}`);
+	const stressed = automaticHandoff(handlers, context, [
+		{ type: "context_window", id: "prior", handoff: "p".repeat(6000) },
+		{ type: "message", id: "first-owner", timestamp: "1", message: { role: "user", content: "a".repeat(6000) } },
+		{ type: "message", id: "latest-owner", timestamp: "2", message: { role: "user", content: "b".repeat(6000) } },
+		{ type: "custom_message", id: "latest-input", timestamp: "3", customType: "intercom", content: "c".repeat(6000), display: true },
+		{ type: "message", id: "stress-assistant", timestamp: "4", message: { role: "assistant", stopReason: "toolUse", content: calls } },
+		...calls.map((call, index) => ({
+			type: "message",
+			id: resultIds[index],
+			timestamp: `${index + 5}`,
+			message: { role: "toolResult", toolCallId: call.id, toolName: call.name, content: `result ${index} ${"r".repeat(1000)}` },
+		})),
+	]);
+	assert.ok(stressed.length <= 20_000);
+	for (const id of resultIds) assert.match(stressed, new RegExp(`entry ${id}\\]`));
 });
 
 test("history returns stored images for a requested entry and summarizes them elsewhere", async () => {
@@ -557,6 +594,19 @@ test("history returns stored images for a requested entry and summarizes them el
 	const laterPage = await run(tools, "history", { op: "read", id: "mixed", offset: 5 }, context);
 	assert.equal(laterPage.content.length, 1, "images ride along with the first page only");
 
+	const longImage = [{
+		type: "message",
+		id: "long-image",
+		parentId: null,
+		timestamp: "4",
+		message: { role: "user", content: [{ type: "text", text: "z".repeat(25_000) }, png] },
+	}];
+	const tightImage = {
+		...usageContext(base, 100_000, 82_117),
+		sessionManager: { getBranch: () => longImage, getSessionDir: () => join(tmpdir(), "missing") },
+	};
+	await assert.rejects(run(tools, "history", { op: "read", id: "long-image" }, tightImage), /Too little context remains/);
+
 	const search = toolText(await run(tools, "history", { op: "search", query: "image/" }, context));
 	assert.match(search, /\[img-tool\] \[toolResult\] \[1 image: image\/jpeg\]/);
 	assert.match(search, /\[img-user\] \[user\] \[1 image: image\/png\]/);
@@ -569,7 +619,7 @@ test("history returns stored images for a requested entry and summarizes them el
 });
 
 test("small-context configurations are unsupported; larger ones derive honest budgets", async () => {
-	for (const contextWindow of [8_192, 16_384]) {
+	for (const contextWindow of [4096, 8_192, 16_384]) {
 		const { handlers, tools, messages, context: base } = setup();
 		const context = usageContext(base, contextWindow, contextWindow - 500);
 		const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, context) as { systemPrompt: string };
@@ -584,17 +634,24 @@ test("small-context configurations are unsupported; larger ones derive honest bu
 		assert.match(remaining, /500 tokens until the hard context limit/);
 		const rollover = await run(tools, "new_context", { handoff: "still works" }, context);
 		assert.deepEqual(rollover.newContext, { handoff: "still works" });
+		const oldLimit = Math.min(20_000, Math.floor(contextWindow / 2) * 4);
+		if (oldLimit < 20_000) {
+			await assert.rejects(
+				run(tools, "new_context", { handoff: "x".repeat(oldLimit) }, context),
+				/too large for the active model/i,
+			);
+		}
 	}
 
 	{
 		const { handlers, messages, context: base } = setup();
-		// 32,768 - 16,384 leaves 16,384 usable: line at 16,385 (50%), band 3,276 tokens wide.
-		const context = usageContext(base, 32_768, 13_200);
+		// 32,768 - 16,384 leaves 16,384 usable: line at 16,385 (50%), band 1,638 tokens wide.
+		const context = usageContext(base, 32_768, 15_000);
 		const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, context) as { systemPrompt: string };
 		assert.match(guidance.systemPrompt, /rollover line \(50% used\)/);
 		turnEnd(handlers, context);
 		assert.equal(messages.length, 1);
-		assert.match(messages[0].content, /3,185 tokens remain/);
+		assert.match(messages[0].content, /1,385 tokens remain/);
 		assert.ok(handlers.get("session_before_auto_compact")!({ reason: "threshold", branchEntries: [] }, context));
 	}
 
@@ -604,7 +661,7 @@ test("small-context configurations are unsupported; larger ones derive honest bu
 		const guidance = handlers.get("before_agent_start")!({ systemPrompt: "base" }, large) as { systemPrompt: string };
 		assert.match(guidance.systemPrompt, /rollover line \(84% used\)/);
 		assert.match(guidance.systemPrompt, /best available native estimate/);
-		// The owner's primary model: gpt-5.6-sol, 272K window with a 64K reserve → line at 208,001 (76%).
+		// A 272K window with a 64K reserve has its line at 208,001 (76%).
 		const sol = usageContext(base, 272_000, 205_000, 64_000);
 		assert.match((handlers.get("before_agent_start")!({ systemPrompt: "base" }, sol) as { systemPrompt: string }).systemPrompt, /rollover line \(76% used\)/);
 		assert.match(toolText(await run(tools, "get_context_remaining", {}, sol)), /^≈3,001 tokens until automatic rollover \(line at 208,001\); ≈67,000 tokens until the hard context limit/);
@@ -615,20 +672,47 @@ test("small-context configurations are unsupported; larger ones derive honest bu
 	}
 });
 
+test("fresh payload budgets count the system prompt, pending input, and automatic handoff", async () => {
+	const { handlers, tools, context: base } = setup();
+	const context = {
+		...usageContext(base, 32_768, 1000),
+		getSystemPrompt: () => "s".repeat(60_000),
+	};
+	await assert.rejects(run(tools, "new_context", { handoff: "h".repeat(10_000) }, context), /limit 0/);
+	assert.equal(
+		handlers.get("session_before_auto_compact")!(
+			{ reason: "threshold", branchEntries: [{ type: "message", id: "owner", message: { role: "user", content: "continue" } }] },
+			context,
+		),
+		undefined,
+	);
+	const pendingContext = { ...usageContext(base, 32_768, 1000), getSystemPrompt: () => "" };
+	const pendingEvent = {
+		reason: "threshold",
+		branchEntries: [],
+		pendingMessages: [{ role: "user", content: "p".repeat(60_000) }],
+	};
+	assert.equal(handlers.get("session_before_auto_compact")!(pendingEvent, pendingContext), undefined);
+	assert.ok(
+		handlers.get("session_before_auto_compact")!(pendingEvent, base),
+		"the handoff cap must not limit separate pending input that fits a larger fresh window",
+	);
+});
+
 test("read pages shrink to the remaining budget and refuse unsafe pages while preserving the offset", async () => {
 	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-page-test-"));
 	try {
 		const { tools, context: base } = setup();
-		const branch = [{ type: "message", id: "long", parentId: null, timestamp: "1", message: { role: "user", content: "h".repeat(5_000) } }];
+		const branch = [{ type: "message", id: "long", parentId: null, timestamp: "1", message: { role: "user", content: "h".repeat(25_000) } }];
 		const withBranch = (context: TestContext) => ({ ...context, cwd: dir, sessionManager: { getBranch: () => branch, getSessionDir: () => dir } });
-		await run(tools, "notes", { op: "write", path: "long.md", content: "n".repeat(5_000) }, withBranch(base));
+		await run(tools, "notes", { op: "write", path: "long.md", content: "n".repeat(25_000) }, withBranch(base));
 
 		// Line at 83,617; 1,500 tokens short of it leaves 500 tokens after the margin: a 2,000-character page.
 		const tight = withBranch(usageContext(base, 100_000, 82_117));
 		const note = toolText(await run(tools, "notes", { op: "read", path: "long.md" }, tight));
-		assert.match(note, /^n{2000}\n\[chars 0-2000 of 5000; continue with offset 2000\]$/);
+		assert.match(note, /^n{2000}\n\[chars 0-2000 of 25000; continue with offset 2000\]$/);
 		const entry = toolText(await run(tools, "history", { op: "read", id: "long" }, tight));
-		assert.match(entry, /\[chars 0-2000 of 5007\] \[user\] h{1993}\nMore remains; call history read with id "long" and offset 2000\.$/);
+		assert.match(entry, /\[chars 0-2000 of 25007\] \[user\] h{1993}\nMore remains; call history read with id "long" and offset 2000\.$/);
 
 		const tighter = withBranch(usageContext(base, 100_000, 82_517));
 		await assert.rejects(run(tools, "notes", { op: "read", path: "long.md", offset: 2000 }, tighter), /Call new_context first, then retry with offset 2000/);
@@ -637,8 +721,11 @@ test("read pages shrink to the remaining budget and refuse unsafe pages while pr
 		// Disabled compaction measures against the hard limit instead of the rollover line.
 		const disabled = withBranch(usageContext(base, 100_000, 98_000, 16_384, false));
 		assert.match(toolText(await run(tools, "notes", { op: "read", path: "long.md" }, disabled)), /continue with offset 4000/);
-		const unknown = withBranch({ ...base, getContextUsage: () => undefined });
-		assert.doesNotMatch(toolText(await run(tools, "notes", { op: "read", path: "long.md" }, unknown)), /continue with offset/);
+		const unknown = withBranch({ ...base, model: { contextWindow: 4096 }, getContextUsage: () => undefined });
+		const unknownPage = toolText(await run(tools, "notes", { op: "read", path: "long.md" }, unknown));
+		const unknownOffset = unknownPage.match(/continue with offset (\d+)/)?.[1];
+		assert.ok(unknownOffset);
+		assert.ok(Number(unknownOffset) < 8192);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -655,14 +742,19 @@ test("notes resolve the repository root from nested directories, worktrees, and 
 		mkdirSync(join(repo, "packages", "app"), { recursive: true });
 		mkdirSync(join(main, ".git", "worktrees", "wt"), { recursive: true });
 		mkdirSync(join(worktree, "packages", "app"), { recursive: true });
-		writeFileSync(join(worktree, ".git"), "gitdir: ../main/.git/worktrees/wt\n");
+		writeFileSync(join(worktree, ".git"), `gitdir: ${join(main, ".git", "worktrees", "wt")}\n`);
 		mkdirSync(plain, { recursive: true });
 		const { tools, context } = setup();
-		const write = (cwd: string) => run(tools, "notes", { op: "write", path: "state.md", content: cwd }, { ...context, cwd });
+		const notes = (cwd: string, params: Record<string, unknown>) => run(tools, "notes", params, { ...context, cwd });
+		const write = (cwd: string) => notes(cwd, { op: "write", path: "state.md", content: cwd });
 
 		await write(join(repo, "packages", "app"));
 		assert.equal(readFileSync(join(repo, ".pi", "notes", "state.md"), "utf8"), join(repo, "packages", "app"));
 		assert.equal(existsSync(join(repo, "packages", "app", ".pi")), false);
+		await write(worktree);
+		assert.equal(readFileSync(join(main, ".pi", "notes", "state.md"), "utf8"), worktree);
+		assert.equal(toolText(await notes(worktree, { op: "list" })), "state.md");
+		writeFileSync(join(worktree, ".git"), "gitdir: ../main/.git/worktrees/wt\n");
 		await write(join(worktree, "packages", "app"));
 		assert.equal(readFileSync(join(main, ".pi", "notes", "state.md"), "utf8"), join(worktree, "packages", "app"));
 		assert.equal(existsSync(join(worktree, ".pi")), false);
@@ -702,7 +794,7 @@ test("long notes page fully, empty writes clear, appends stay separated, and sea
 		assert.equal(readFileSync(join(dir, ".pi", "notes", "log.md"), "utf8"), "X\nY\n");
 		await assert.rejects(notes({ op: "append", path: "log.md", content: "" }), /"content" is required/);
 
-		await notes({ op: "write", path: "search.md", content: `${"x".repeat(250)} needle-here ${"y".repeat(100)}\nsecond line` });
+		await notes({ op: "write", path: "search.md", content: `${" ".repeat(100)}${"x".repeat(250)} needle-here ${"y".repeat(100)}\nsecond line` });
 		const hits = toolText(await notes({ op: "search", query: "NEEDLE-here" }));
 		assert.match(hits, /^search\.md:1: …x{49} needle-here y{100}$/);
 	} finally {
