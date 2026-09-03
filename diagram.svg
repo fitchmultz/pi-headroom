@@ -172,11 +172,11 @@
     </g>
     <text class="sans cardtitle" x="484" y="625">Recovery record</text>
     <text class="sans cardbody" x="448" y="668">Owner inputs, ask_question</text>
-    <text class="sans cardbody" x="448" y="690">answers, visible coordination:</text>
-    <text class="sans cardbody" x="448" y="712">labeled, chronological, ≤ 20k</text>
-    <text class="sans cardbody" x="448" y="734">chars. Older checkpoint marked</text>
-    <text class="sans cardbody" x="448" y="756">possibly stale. No assistant</text>
-    <text class="sans cardbody" x="448" y="778">prose is treated as state.</text>
+    <text class="sans cardbody" x="448" y="690">answers, visible coordination,</text>
+    <text class="sans cardbody" x="448" y="712">unconsumed tool batch: labeled,</text>
+    <text class="sans cardbody" x="448" y="734">chronological, ≤ 20k chars.</text>
+    <text class="sans cardbody" x="448" y="756">Older checkpoint marked stale.</text>
+    <text class="sans cardbody" x="448" y="778">Assistant prose is not state.</text>
     <rect x="448" y="796" width="184" height="26" rx="13" fill="#3A2A10"/>
     <text class="mono chip" x="540" y="813" fill="#F59E0B">EMERGENCY INPUT RECORD</text>
   </g>
