@@ -3,12 +3,13 @@
 	"version": "0.4.0",
 	"type": "module",
 	"description": "Posthorse: fresh context, same journey. Native no-summary context windows for the fitchmultz/pi fork, with sparse budget reminders, handoffs, notes, and history.",
-	"keywords": ["pi-package", "pi-extension", "context", "posthorse", "headroom"],
+	"keywords": ["pi-package", "pi-extension", "context", "posthorse", "rollover"],
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/fitchmultz/pi-posthorse.git"
 	},
 	"license": "MIT",
+	"files": ["index.ts"],
 	"engines": {
 		"node": ">=22.19.0"
 	},

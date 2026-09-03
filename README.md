@@ -1,52 +1,90 @@
-# pi-headroom
+# Posthorse
 
-Native, model-managed context windows for a personal patched [Pi](https://github.com/earendil-works/pi): hard cutovers without lossy compaction summaries.
+**Fresh context. Same journey.** (POST-horse)
 
-![pi-headroom flow](diagram.png)
+Native, no-summary context windows for the [`fitchmultz/pi`](https://github.com/fitchmultz/pi) fork of [Pi](https://github.com/earendil-works/pi). A post-horse was swapped in at relay stations so the courier and the message could continue on fresh legs. Posthorse does the same for a model: fresh context, same work, complete recoverable transcript.
 
-The model gets stable window guidance, a best-effort near-limit checkpoint, and an on-demand budget tool. A rollover removes the old window from active model context while preserving the complete session transcript.
+![Posthorse flow](diagram.png)
 
-## Requirement
+Pi owns the persisted boundary. Posthorse owns the policy: stable window guidance, one best-effort checkpoint reminder, `new_context`, `get_context_remaining`, durable `notes`, and window-aware `history`. A rollover removes the old window from active model context while the JSONL transcript stays append-only and complete.
 
-This version requires the native context-window patch on the personal [`fitchmultz/pi`](https://github.com/fitchmultz/pi) fork. The official Pi package does not yet provide the boundary used here.
+## Requirements
 
-Build the patched checkout, then launch its CLI directly with the extension:
+- Node `>=22.19.0`.
+- The `fitchmultz/pi` fork at revision `PI_FORK_REVISION` or newer. Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
+- Official, unpatched Pi is unsupported. Posthorse detects it at session start and stops with a clear error instead of degrading.
+
+## Install
+
+Build the fork once:
 
 ```bash
-cd /Users/mitchfultz/Projects/pi
+git clone https://github.com/fitchmultz/pi.git
+cd pi
+git checkout PI_FORK_REVISION
+npm install --ignore-scripts
 npm run build
-node packages/coding-agent/dist/bundle/cli.js \
-  -e /Users/mitchfultz/Projects/pi-stuff/pi-headroom/index.ts
 ```
 
-A `pi` launcher linked to that patched bundle works too.
+Run it as `node packages/coding-agent/dist/bundle/cli.js`, or run `npm link` inside `packages/coding-agent` so that build becomes your `pi` command.
+
+Then install Posthorse with that `pi`:
+
+```bash
+pi install git:github.com/fitchmultz/pi-posthorse        # from Git; add @<tag> to pin a release
+pi install npm:pi-posthorse                               # once published
+pi -e git:github.com/fitchmultz/pi-posthorse              # try it for one run without installing
+```
+
+Update with `pi update npm:pi-posthorse` or `pi update --extensions`; move a pinned Git install with `pi install git:github.com/fitchmultz/pi-posthorse@<new tag>`. Uninstall with `pi remove npm:pi-posthorse` (or the Git source you installed). Removing the package leaves `.pi/notes` and Pi's session history in place.
+
+Keep exactly one copy loaded. `pi list` shows every package source; if an older entry such as `git:github.com/fitchmultz/pi-headroom.git` or a local checkout is still listed, `pi remove` it before installing the npm package, otherwise two copies register the same tools and compete for the same rollover hook.
 
 ## How it works
 
-1. **Stable guidance** — window behavior is part of the system prompt. There is no changing per-request meter to churn the prompt.
-2. **Best-effort checkpoint** — while Pi compaction is enabled, one reminder may appear shortly before the configured reserve line. A large turn, overflow, restart, or smaller model can reach rollover without it.
-3. **`get_context_remaining`** — returns an exact native usage reading only when the model needs it.
-4. **`new_context`** — requests an atomic rollover after the complete tool batch. An optional handoff is persisted and becomes the first state in the fresh window.
-5. **Automatic recovery** — Pi's enabled automatic summary-compaction path becomes the same no-summary rollover. Its bounded recovery record keeps direct user inputs, `ask_question` outcomes, and visible coordination from the current window. Older handoffs are labeled possibly stale; assistant prose is not treated as state.
-6. **Late-reminder filter** — an old-window reminder is removed from model input if queue ordering lets it arrive after a boundary. The persisted transcript remains untouched.
-7. **`notes` and `history`** — durable project notes and normalized, window-aware transcript recovery remain available after rollover. All-session history searches nested session files from newest to oldest.
+1. **Stable guidance.** Window behavior is part of the system prompt. There is no per-request meter to churn the prompt.
+2. **One best-effort checkpoint.** While Pi compaction is enabled, one reminder may appear shortly before Pi's rollover line. A large turn, overflow, restart, or smaller model can reach rollover without it. Reminders are fingerprinted by window, context size, and reserve, so switching models inside a window gets a fresh reminder and stale ones are filtered from model input.
+3. **`get_context_remaining`.** Reports the best available native estimate of tokens until Pi's automatic rollover line and until the model's hard limit. Pi's value is an estimate until the active model reports usage.
+4. **`new_context`.** Requests an atomic rollover after the complete tool batch succeeds. An optional handoff is persisted and becomes the first state of the fresh window. If a sibling tool in the same batch fails, Pi does not commit the boundary; the checkpoint reminder still applies.
+5. **Automatic rollover without summaries.** Posthorse claims Pi's automatic threshold and overflow trigger through `session_before_auto_compact`, before Pi resolves summarization credentials or prepares a summary. A single oversized first turn, an oversized tool result, or a missing summarization login all still roll over. Manual `/compact` is unchanged.
+6. **Bounded recovery record.** The automatic handoff keeps direct user inputs, `ask_question` outcomes, visible coordination messages, a clearly labeled older checkpoint, and the trailing tool batch that no model has consumed yet (call arguments, bounded result text, and the entry ids to recover the rest). Older assistant prose and consumed tool results are not treated as state.
+7. **`notes` and `history`.** Notes live with the repository root, shared across linked worktrees. History searches normalized transcript text and returns stored images for a requested entry.
 
-Automatic recovery is an emergency input record, not proof of current progress. The fresh model is told to restore notes and todo state, inspect history when needed, and verify live state before taking stateful or external action.
-
-Pi persists a real `context_window` session entry. Session replay, usage accounting, branch navigation, compaction, and provider input use the same authoritative boundary; the JSONL transcript remains append-only and complete.
+Automatic recovery is an emergency input record, not proof of progress. The fresh model is told to restore notes and todo state, inspect history when needed, and verify live state before taking stateful or external action.
 
 ## Settings
 
-Headroom follows Pi's `compaction.enabled` setting. Disabling automatic compaction also disables checkpoint reminders and automatic headroom rollover; explicit `new_context` remains available. Manual `/compact` is unchanged.
+Posthorse follows Pi's effective `compaction` settings, including Pi's decision about whether project settings are trusted. Disabling `compaction.enabled` disables reminders and automatic rollover; `new_context` stays available.
+
+The model's context window minus `compaction.reserveTokens` must leave at least 10,000 usable tokens. Below that (for example an 8K or 16K model with the default 16,384 reserve) Posthorse reports an unsupported configuration in the guidance and in `get_context_remaining`, turns automatic behavior off for that model, and leaves Pi's own compaction in place. Lower the reserve or use a larger model.
+
+Only one automatic compaction or rollover policy extension should be enabled at a time. Pi keeps the last non-cancel result from multiple handlers of the same hook, so load order would otherwise decide which policy wins.
 
 ## Tools
 
 - `new_context({ handoff? })`
 - `get_context_remaining()`
-- `notes({ op, ... })`: `list`, `read`, `write`, `append`, `search`
-- `history({ op, ... })`: `search`, `read`; results include native window IDs, and long reads return the next character offset
+- `notes({ op, ... })`: `list`, `read` (paged; `offset` continues), `write` (empty content clears), `append` (one atomic newline-terminated record), `search` (excerpts centered on the match)
+- `history({ op, ... })`: `search`, `read`; results carry native window ids, reads return stored images with the first page and the next character offset when text remains
 
-Notes live in `.pi/notes/` of the main checkout; a linked git worktree shares that notebook instead of getting one that dies with the worktree. Add the directory to `.gitignore` when the project should not track it.
+Read pages shrink to the context that is actually left and are refused, with the offset preserved, when too little remains; call `new_context` and retry.
+
+`history` with `all: true` scans every session file in the active Pi session directory, newest-modified sessions first and newest entries within each session; it is not a global newest-first ranking. Entries copied by a fork are reported once.
+
+Notes live in `.pi/notes/` at the repository root (the main checkout for a linked worktree, the current directory outside Git). Add the directory to `.gitignore` when the project should not track it.
+
+## Data and privacy
+
+- Posthorse makes no network requests.
+- Notes are plaintext files under `.pi/notes`. They survive package removal and are committed unless ignored.
+- `history` with `all: true` scans nested JSONL files in the active Pi session directory, including subagent sessions.
+- History can return user text, assistant text and thinking, tool arguments and results, handoffs, custom messages, and images. Direct shell entries Pi marked `excludeFromContext` come back as a placeholder only.
+- Returned history content enters the currently selected model and provider context.
+- Removing Posthorse does not remove notes or Pi session history.
+
+## Compatibility
+
+Reminders persisted by pi-headroom (`headroom-reminder`) are recognized alongside `posthorse-reminder` for deduplication, filtering, and recovery records. Notes, tool names, `.pi/notes`, and Pi's `context_window` entries are unchanged.
 
 ## Develop
 
@@ -54,6 +92,7 @@ Notes live in `.pi/notes/` of the main checkout; a linked git worktree shares th
 npm ci
 npm test
 npm run check
+PI_FORK=../pi scripts/integration.sh   # loads the real extension into the fork's test harness (fork built)
 ```
 
-For end-to-end testing, use the patched Pi bundle or a `pi` launcher that resolves to it.
+`npm run check` type-checks `index.ts` and the unit tests; the integration test type-checks inside the fork. CI runs the unit tests on Node 22.19 and 24, `npm audit`, `npm pack --dry-run`, and the integration job against the pinned fork revision.
