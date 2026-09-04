@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.1
+
+Compatibility update for Pi 0.85.0; runtime behavior is unchanged.
+
+- Updates the Pi development dependency and integration CI to the tested 0.85.0 fork.
+- Clarifies that linked Pi installations must be rebuilt after updating their source.
+
 ## 0.4.0
 
 Renamed to Posthorse (`pi-posthorse`). Requires the `fitchmultz/pi` fork at the revision pinned in the README.
