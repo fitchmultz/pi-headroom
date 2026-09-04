@@ -80,6 +80,11 @@ describe("Posthorse inside the Pi fork", () => {
 		const harness = await createHarness({ tools: [dump], extensionFactories: [posthorse] });
 		harnesses.push(harness);
 		forbidSummarizationAuth(harness);
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("new_context", { handoff: "FIRST read obsolete-checkpoint.md" }), { stopReason: "toolUse" }),
+			fauxAssistantMessage("ready"),
+		]);
+		await harness.session.prompt("checkpoint before current work");
 		let freshTexts: string[] = [];
 		harness.setResponses([
 			fauxAssistantMessage([{ type: "text", text: "OLD ASSISTANT PROSE" }, fauxToolCall("dump", {})], { stopReason: "toolUse" }),
@@ -92,7 +97,7 @@ describe("Posthorse inside the Pi fork", () => {
 
 		await harness.session.prompt("dump everything");
 
-		expect(contextWindows(harness)).toBe(1);
+		expect(contextWindows(harness)).toBe(2);
 		expect(branchTypes(harness).filter((type) => type === "compaction")).toEqual([]);
 		expect(freshTexts).toHaveLength(1);
 		const handoff = freshTexts[0];
@@ -101,12 +106,37 @@ describe("Posthorse inside the Pi fork", () => {
 		expect(handoff).toContain("Unconsumed tool batch");
 		expect(handoff).toMatch(/\[result entry [^\]]+\]\nDUMP HEAD r+\n… middle omitted …\nr+ DUMP TAIL/);
 		expect(handoff).not.toContain("OLD ASSISTANT PROSE");
+		expect(handoff.indexOf("dump everything")).toBeLessThan(handoff.indexOf("Unconsumed tool batch"));
+		expect(handoff.indexOf("DUMP TAIL")).toBeLessThan(handoff.indexOf("older checkpoint"));
+		expect(handoff).toContain("FIRST read obsolete-checkpoint.md");
 		expect(handoff.length).toBeLessThanOrEqual(20_000);
 
 		// The fresh window read the oversized result back through the append-only transcript.
 		const recovered = harness.session.messages.find((message) => message.role === "toolResult" && message.toolName === "history");
 		expect(getMessageText(recovered)).toMatch(/\[chars 0-\d+ of 600\d+\] \[toolResult\] DUMP HEAD/);
 		expect(getMessageText(recovered)).toMatch(/More remains; call history read with id ".+" and offset \d+\./);
+		expect(harness.getPendingResponseCount()).toBe(0);
+	});
+
+	it("finds the original request before its own persisted search call and keeps the call searchable", async () => {
+		const harness = await createHarness({ extensionFactories: [posthorse] });
+		harnesses.push(harness);
+		const results: string[] = [];
+		harness.setResponses([
+			fauxAssistantMessage(fauxToolCall("history", { op: "search", query: "needle", limit: 1 }), { stopReason: "toolUse" }),
+			(context) => {
+				results.push(getMessageText(context.messages.at(-1)));
+				return fauxAssistantMessage(fauxToolCall("history", { op: "search", query: '"limit":1', limit: 5 }), { stopReason: "toolUse" });
+			},
+			(context) => {
+				results.push(getMessageText(context.messages.at(-1)));
+				return fauxAssistantMessage("recovered");
+			},
+		]);
+		await harness.session.prompt("needle original request");
+		expect(results[0]).toContain("[user] needle original request");
+		expect(results[0]).not.toContain("[assistant] history");
+		expect(results[1]).toContain('[assistant] history {"op":"search","query":"needle","limit":1}');
 		expect(harness.getPendingResponseCount()).toBe(0);
 	});
 
@@ -159,7 +189,7 @@ describe("Posthorse inside the Pi fork", () => {
 		expect(handoff).not.toContain(PNG.slice(0, 20));
 		const recovered = harness.session.messages.find((message) => message.role === "toolResult" && message.toolName === "history");
 		expect(getMessageText(recovered)).toContain("[toolResult] SNAP CAPTION");
-		expect(recovered?.content).toContainEqual({ type: "image", data: PNG, mimeType: "image/png" });
+		expect(recovered).toMatchObject({ content: expect.arrayContaining([{ type: "image", data: PNG, mimeType: "image/png" }]) });
 	});
 
 	it("rolls over a single oversized first owner turn on overflow and retries once", async () => {
