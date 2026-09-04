@@ -11,20 +11,22 @@ Pi owns the persisted boundary. Posthorse owns the policy: stable window guidanc
 ## Requirements
 
 - Node `>=22.19.0`.
-- The `fitchmultz/pi` fork at commit `0291ae42151fe0f77bacb13182186039be92eaea` ([PR #6](https://github.com/fitchmultz/pi/pull/6)) or newer. Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
+- The `fitchmultz/pi` fork. The current tested revision is `f9b06177e565f70cd243a785d088d1c491830dbd` (Pi `0.85.0`). Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
 - Official, unpatched Pi is unsupported. Posthorse reports a clear extension error at session start and cannot operate; Pi itself keeps running.
 
 ## Install
 
-Build the fork once:
+Build the fork:
 
 ```bash
 git clone https://github.com/fitchmultz/pi.git
 cd pi
-git checkout 0291ae42151fe0f77bacb13182186039be92eaea
+git checkout f9b06177e565f70cd243a785d088d1c491830dbd
 npm install --ignore-scripts
 npm run build
 ```
+
+After updating the fork, run the install and build commands again, then restart Pi. `pi --version` reads the checkout's package metadata, so it does not prove that the updated source has been built.
 
 Run it as `node packages/coding-agent/dist/bundle/cli.js`, or run `npm link` inside `packages/coding-agent` so that build becomes your `pi` command.
 
