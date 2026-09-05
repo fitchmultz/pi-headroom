@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1080" viewBox="0 0 1600 1080" role="img" aria-labelledby="t d">
   <title id="t">Posthorse flow</title>
-  <desc id="d">Two paths reach the same native Pi context-window boundary: the model checkpoints on purpose and calls new_context, or Pi's enabled automatic compaction becomes a no-summary rollover with a bounded recovery record. The fresh window restores notes, todos, and history from the complete on-disk transcript.</desc>
+  <desc id="d">Two paths reach the same native Pi context-window boundary: the model checkpoints on purpose and calls new_context, or, with a supported budget and room for a recovery record, Pi's enabled automatic compaction becomes a no-summary rollover. Otherwise Pi keeps its own compaction. The fresh window restores notes, todos, and history from the complete on-disk transcript.</desc>
 
   <style>
     .sans { font-family: Inter, ui-sans-serif, Arial, sans-serif; }
@@ -60,7 +60,8 @@
   <!-- title block -->
   <text class="mono eyebrow" x="72" y="84">PI EXTENSION — FRESH CONTEXT. SAME JOURNEY.</text>
   <text class="sans title" x="72" y="134">Posthorse</text>
-  <text class="sans subtitle" x="72" y="170">One native hard cutover, reached by the model on purpose or by Pi as a fallback — never an automatic lossy summary.</text>
+  <text class="sans subtitle" x="72" y="170">Explicit checkpoints and supported automatic rollovers share one native boundary, without a summary.</text>
+  <text class="sans subtitle" x="72" y="196">If the budget is unsupported or no recovery record fits, Pi keeps its own compaction.</text>
 
   <!-- tool surface (top right) -->
   <g id="tools">
@@ -91,7 +92,7 @@
   <g id="disk-zone">
     <rect x="72" y="900" width="1456" height="112" rx="16" fill="#0E1525" stroke="#334155" stroke-width="1.5" stroke-dasharray="6 5"/>
     <text class="mono micro" x="96" y="946">ON DISK · SURVIVES RESETS AND RESTARTS</text>
-    <text class="sans storebody" x="96" y="972">Nothing is summarized away. Every window stays in the append-only transcript,</text>
+    <text class="sans storebody" x="96" y="972">Every window stays in the append-only transcript,</text>
     <text class="sans storebody" x="96" y="992">and the notes tool keeps durable state beside it.</text>
   </g>
 
@@ -156,9 +157,9 @@
     <text class="sans cardbody" x="96" y="668">Pi's enabled compaction fires</text>
     <text class="sans cardbody" x="96" y="690">on threshold, overflow, or a</text>
     <text class="sans cardbody" x="96" y="712">restart into a smaller model.</text>
-    <text class="sans cardbody" x="96" y="734">Posthorse claims the trigger</text>
-    <text class="sans cardbody" x="96" y="756">with newContext — no summary.</text>
-    <text class="sans cardbody" x="96" y="778">Manual /compact is untouched.</text>
+    <text class="sans cardbody" x="96" y="734">With a supported budget and</text>
+    <text class="sans cardbody" x="96" y="756">room for a recovery record,</text>
+    <text class="sans cardbody" x="96" y="778">Posthorse rolls over.</text>
     <rect x="96" y="796" width="216" height="26" rx="13" fill="#3A2A10"/>
     <text class="mono chip" x="204" y="813" fill="#F59E0B">FOLLOWS compaction.enabled</text>
   </g>
