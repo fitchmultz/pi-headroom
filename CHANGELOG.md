@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.3
+
+Documentation correction; runtime behavior is unchanged.
+
+- Clarifies npm installation and the reload step after package updates.
+- Qualifies automatic rollover's compaction fallback and makes the README diagram link absolute.
+
 ## 0.4.2
 
 - Shows current-window inputs and unconsumed tool results before the older checkpoint in automatic recovery records.

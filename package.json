@@ -1,6 +1,6 @@
 {
 	"name": "pi-posthorse",
-	"version": "0.4.2",
+	"version": "0.4.3",
 	"type": "module",
 	"description": "Posthorse: fresh context, same journey. Native no-summary context windows for the fitchmultz/pi fork, with sparse budget reminders, handoffs, notes, and history.",
 	"keywords": ["pi-package", "pi-extension", "context", "posthorse", "rollover"],
