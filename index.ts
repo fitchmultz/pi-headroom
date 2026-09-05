@@ -86,6 +86,7 @@ type EntryLike = {
 };
 
 type WindowedEntry = { entry: EntryLike; windowId: string; text: string; images: ImageLike[] };
+type HistoryHit = { id: string; text: string; priority: 0 | 1 };
 type RecoveryRecord = {
 	id: string;
 	timestamp: string;
@@ -215,6 +216,60 @@ function flattenEntry(entry: EntryLike): string | undefined {
 	return undefined;
 }
 
+function isRecoveryTool(name: unknown): boolean {
+	return name === "history" || name === "notes" || name === "new_context";
+}
+
+function isRecoveryCall(part: unknown): boolean {
+	const block = part as { type?: string; name?: string } | null;
+	return block?.type === "toolCall" && isRecoveryTool(block.name);
+}
+
+function historyHit(item: WindowedEntry, query: string, source = ""): HistoryHit | undefined {
+	const { entry } = item;
+	let text = item.text;
+	let matchIndex = text.toLowerCase().indexOf(query);
+	if (matchIndex === -1) return undefined;
+	let priority: 0 | 1 =
+		entry.type === "context_window" ||
+		entry.type === "compaction" ||
+		entry.type === "branch_summary" ||
+		(entry.type === "custom_message" && isReminderType(entry.customType)) ||
+		(entry.type === "message" && entry.message?.role === "toolResult" && isRecoveryTool(entry.message.toolName))
+			? 1
+			: 0;
+
+	if (
+		entry.type === "message" && entry.message?.role === "assistant" &&
+		Array.isArray(entry.message.content) && entry.message.content.some(isRecoveryCall)
+	) {
+		// A lookup beside a matching ordinary call or prose must not demote that original content.
+		const originals = [""];
+		for (const part of entry.message.content) {
+			if (isRecoveryCall(part)) {
+				originals.push("");
+			} else {
+				const partText = textOf({ content: [part] });
+				if (partText) originals[originals.length - 1] += `${originals.at(-1) ? "\n" : ""}${partText}`;
+			}
+		}
+		const images = imageSummary(item.images);
+		if (images) originals[originals.length - 1] += `${originals.at(-1) ? "\n" : ""}${images}`;
+		if (originals[0]) originals[0] = `[assistant] ${originals[0]}`;
+		const original = originals.find((part) => part.toLowerCase().includes(query));
+		priority = original ? 0 : 1;
+		if (original) {
+			text = original === originals[0] ? original : `[assistant] ${original}`;
+			matchIndex = text.toLowerCase().indexOf(query);
+		}
+	}
+	return {
+		id: entry.id!,
+		priority,
+		text: `${source ? `${source} ` : ""}${entry.timestamp ?? ""} [window ${item.windowId}] [${entry.id}] ${excerptAround(text, matchIndex, 100, 400)}`,
+	};
+}
+
 function toWindowedEntry(entry: EntryLike, windows: Map<string, string>): WindowedEntry | undefined {
 	const inheritedWindow = entry.parentId ? (windows.get(entry.parentId) ?? "initial") : "initial";
 	const windowId = entry.type === "context_window" && entry.id ? entry.id : inheritedWindow;
@@ -257,10 +312,14 @@ async function* sessionWindowEntries(file: string, signal?: AbortSignal): AsyncG
 
 function sessionFiles(dir: string): string[] {
 	if (!existsSync(dir)) return [];
-	return readdirSync(dir, { recursive: true, withFileTypes: true })
+	const files = readdirSync(dir, { recursive: true, withFileTypes: true })
 		.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl") && !entry.name.includes(".intent."))
-		.map((entry) => join(entry.parentPath, entry.name))
-		.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
+		.map((entry) => join(entry.parentPath, entry.name));
+	if (files.length < 2) return files;
+	return files
+		.map((file) => ({ file, mtime: statSync(file).mtimeMs }))
+		.sort((a, b) => b.mtime - a.mtime)
+		.map(({ file }) => file);
 }
 
 function currentWindowId(entries: readonly EntryLike[]): string {
@@ -422,10 +481,10 @@ function buildAutoHandoff(entries: readonly EntryLike[], maxChars: number): stri
 		: undefined;
 	const minimumParts = [
 		preamble,
-		formatPriorCheckpoint(priorWindow, 0),
 		currentHeader,
 		...records.filter((record) => selected.has(record)).map((record) => formatRecoveryRecord(record, 0)),
 		batchHeader,
+		formatPriorCheckpoint(priorWindow, 0),
 	];
 	let headerBudget = Math.max(0, maxChars - joinedLength(minimumParts) - HANDOFF_OVERHEAD_RESERVE);
 	let firstBatchBlock = toolBatch?.blocks.length ?? 0;
@@ -461,7 +520,6 @@ function buildAutoHandoff(entries: readonly EntryLike[], maxChars: number): stri
 	);
 	const fixedParts = () => [
 		preamble,
-		prior,
 		currentHeader,
 		...records.filter((record) => selected.has(record)).map((record) => formatted.get(record)!),
 	];
@@ -471,7 +529,7 @@ function buildAutoHandoff(entries: readonly EntryLike[], maxChars: number): stri
 		const availableText = Math.max(
 			0,
 			maxChars -
-				joinedLength([...fixedParts(), bareBatch]) -
+				joinedLength([...fixedParts(), bareBatch, prior]) -
 				HANDOFF_OVERHEAD_RESERVE -
 				batchBlocks.length,
 		);
@@ -485,7 +543,7 @@ function buildAutoHandoff(entries: readonly EntryLike[], maxChars: number): stri
 			.join("\n\n");
 	}
 
-	let optionalBudget = Math.max(0, maxChars - joinedLength([...fixedParts(), batch]) - HANDOFF_OVERHEAD_RESERVE);
+	let optionalBudget = Math.max(0, maxChars - joinedLength([...fixedParts(), batch, prior]) - HANDOFF_OVERHEAD_RESERVE);
 	for (let i = records.length - 1; i >= 0; i--) {
 		const record = records[i];
 		if (selected.has(record)) continue;
@@ -499,7 +557,7 @@ function buildAutoHandoff(entries: readonly EntryLike[], maxChars: number): stri
 	const omission = omitted.length
 		? `Omitted ${omitted.length} current-window input(s) to stay within the handoff limit (${omitted.filter((record) => record.kind === "owner").length} owner, ${omitted.filter((record) => record.kind === "coordination").length} coordination; ${omitted[0].timestamp} through ${omitted.at(-1)!.timestamp}). Use history search/read to recover them.`
 		: undefined;
-	return [...fixedParts(), omission, batch].filter((part): part is string => Boolean(part)).join("\n\n");
+	return [...fixedParts(), omission, batch, prior].filter((part): part is string => Boolean(part)).join("\n\n");
 }
 
 /** Legacy reminders carry only windowId; they match on it alone until the model changes. */
@@ -880,7 +938,7 @@ export default function (pi: ExtensionAPI) {
 		name: "history",
 		label: "History",
 		description:
-			"Search or read normalized session entries, including earlier native context windows. Current branch is searched by default; all=true searches every project session file, newest-modified sessions first and newest entries within each session. Reads return stored images and page long text with the next offset.",
+			"Search or read normalized session entries, including earlier native context windows. Search prioritizes original content before recovery notes, handoffs, and history lookups; all remain searchable. Current branch by default; all=true searches every project session file. Within each group: newest-modified sessions first, newest entries per session. Reads return stored images and page long text with the next offset.",
 		promptSnippet: "recover earlier conversation that left the active context window",
 		promptGuidelines: ["Use history search first, then history read with the returned entry id"],
 		parameters: Type.Object({
@@ -897,39 +955,39 @@ export default function (pi: ExtensionAPI) {
 			if (params.op === "search") {
 				const query = requireValue(params.query, "query", params.op).toLowerCase();
 				const limit = params.limit ?? 10;
-				const hits: string[] = [];
+				const hits: string[][] = [[], []];
 				// Forks copy ancestor entries under the same ids into new session files; report each id once.
 				const seen = new Set<string>();
-				const addHit = (item: WindowedEntry, source = "") => {
-					const matchIndex = item.text.toLowerCase().indexOf(query);
-					if (matchIndex === -1 || seen.has(item.entry.id!)) return;
-					seen.add(item.entry.id!);
-					hits.push(
-						`${source ? `${source} ` : ""}${item.entry.timestamp ?? ""} [window ${item.windowId}] [${item.entry.id}] ${excerptAround(item.text, matchIndex, 100, 400)}`,
-					);
+				const addHit = (hit: HistoryHit | undefined) => {
+					if (!hit || seen.has(hit.id) || hits[hit.priority].length >= limit) return;
+					seen.add(hit.id);
+					hits[hit.priority].push(hit.text);
 				};
 
 				if (params.all) {
-					files: for (const file of sessionFiles(manager.getSessionDir())) {
-						const recent: WindowedEntry[] = [];
+					for (const file of sessionFiles(manager.getSessionDir())) {
+						const recent: HistoryHit[][] = [[], []];
+						const source = relative(manager.getSessionDir(), file);
 						for await (const item of sessionWindowEntries(file, signal)) {
-							if (seen.has(item.entry.id!) || !item.text.toLowerCase().includes(query)) continue;
-							recent.push(item);
-							if (recent.length > limit - hits.length) recent.shift();
+							if (seen.has(item.entry.id!)) continue;
+							const hit = historyHit(item, query, source);
+							if (!hit) continue;
+							const group = recent[hit.priority];
+							group.push(hit);
+							if (group.length > limit - hits[hit.priority].length) group.shift();
 						}
-						for (const item of recent.reverse()) {
-							addHit(item, relative(manager.getSessionDir(), file));
-							if (hits.length >= limit) break files;
-						}
+						for (const group of recent) for (const hit of group.reverse()) addHit(hit);
+						if (hits[0].length >= limit) break;
 					}
 				} else {
 					const current = [...windowEntries(manager.getBranch() as EntryLike[])];
 					for (const item of current.reverse()) {
-						addHit(item);
-						if (hits.length >= limit) break;
+						addHit(historyHit(item, query));
+						if (hits[0].length >= limit) break;
 					}
 				}
-				return textResult(hits.length ? hits.join("\n") : `No history matches "${params.query}".`);
+				const results = hits.flat().slice(0, limit);
+				return textResult(results.length ? results.join("\n") : `No history matches "${params.query}".`);
 			}
 
 			const id = requireValue(params.id, "id", params.op);

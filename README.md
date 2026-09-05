@@ -49,7 +49,7 @@ Keep exactly one copy loaded. `pi list` shows every package source; if an older 
 3. **`get_context_remaining`.** Reports the best available native estimate of tokens until Pi's automatic rollover line and until the model's hard limit. Pi's value is an estimate until the active model reports usage.
 4. **`new_context`.** Requests an atomic rollover after the complete tool batch succeeds. An optional handoff is persisted and becomes the first state of the fresh window. If a sibling tool in the same batch fails, Pi does not commit the boundary; the checkpoint reminder still applies.
 5. **Automatic rollover without summaries.** Posthorse claims Pi's automatic threshold and overflow trigger through `session_before_auto_compact`, before Pi resolves summarization credentials or prepares a summary. A single oversized first turn, an oversized tool result, or a missing summarization login all still roll over. Manual `/compact` is unchanged.
-6. **Bounded recovery record.** The automatic handoff keeps direct user inputs, `ask_question` outcomes, visible coordination messages, a clearly labeled older checkpoint, and the trailing tool batch that no model has consumed yet (call arguments, bounded result text, and the entry ids to recover the rest). Older assistant prose and consumed tool results are not treated as state. Newly submitted input stays separate and is saved after the boundary, not copied into the handoff.
+6. **Bounded recovery record.** The automatic handoff keeps direct user inputs, `ask_question` outcomes, visible coordination messages, and the trailing tool batch that no model has consumed yet (call arguments, bounded result text, and the entry ids to recover the rest). A clearly labeled, possibly stale older checkpoint comes last, after the current inputs and unseen results. Older assistant prose and consumed tool results are not treated as state. Newly submitted input stays separate and is saved after the boundary, not copied into the handoff.
 7. **`notes` and `history`.** Notes live with the repository root, shared across linked worktrees. History searches normalized transcript text and returns stored images for a requested entry.
 
 Automatic recovery is an emergency input record, not proof of progress. The fresh model is told to restore notes and todo state, inspect history when needed, and verify live state before taking stateful or external action.
@@ -73,7 +73,9 @@ Only one automatic compaction or rollover policy extension should be enabled at 
 
 Read pages, including returned images, shrink to the context that is actually left. Before usage is known, they reserve prompt/tool overhead and leave half the rest free. Unsafe pages are refused with the offset preserved; call `new_context` and retry.
 
-`history` with `all: true` scans every session file in the active Pi session directory, newest-modified sessions first and newest entries within each session; it is not a global newest-first ranking. Entries copied by a fork are reported once.
+`history search` puts matching original content before recovery material: handoffs, compaction and branch summaries, checkpoint reminders, and `notes`, `new_context`, and `history` calls/results. Ordinary prose or another tool call in the same assistant entry keeps its priority when that content matches. Every entry remains searchable; `history read` returns the complete normalized entry, including any recovery content omitted from a search excerpt.
+
+Within each group, current-branch matches are newest first. With `all: true`, Posthorse searches every session file in the active Pi session directory, newest-modified sessions first and newest entries within each session; this is not a global timestamp sort. The result limit applies after priority, so newer echoes cannot displace older original matches. Entries copied by a fork are reported once.
 
 Notes live in `.pi/notes/` at the repository root (the main checkout for a linked worktree, the current directory outside Git). Add the directory to `.gitignore` when the project should not track it.
 
@@ -99,4 +101,4 @@ npm run check
 PI_FORK=../pi scripts/integration.sh   # loads the real extension into the fork's test harness (fork built)
 ```
 
-`npm run check` type-checks `index.ts` and the unit tests; the integration test type-checks inside the fork. CI runs the unit tests on Node 22.19 and 24, `npm audit`, `npm pack --dry-run`, and the integration job against the pinned fork revision.
+`npm run check` type-checks `index.ts` and the unit tests; the integration test runs inside the fork's harness. CI runs the unit tests on Node 22.19 and 24, `npm audit`, `npm pack --dry-run`, and the integration job against the pinned fork revision.

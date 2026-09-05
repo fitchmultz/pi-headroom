@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -121,6 +121,7 @@ test("new_context returns an atomic handoff and automatic rollover builds a reco
 	assert.match(prior, /older checkpoint; possibly stale/);
 	assert.match(prior, /persisted task/);
 	assert.match(prior, /No selected current-window/);
+	assert.ok(prior.indexOf("No selected current-window") < prior.indexOf("older checkpoint"));
 
 	const nonRecursive = automaticHandoff(handlers, context, [
 		{
@@ -184,6 +185,7 @@ test("automatic recovery keeps owner anchors and visible coordination without st
 	assert.match(handoff, /Omitted \d+ current-window input/);
 	assert.ok(handoff.indexOf("entry owner-start") < handoff.indexOf("entry owner-answer"));
 	assert.ok(handoff.indexOf("entry owner-answer") < handoff.indexOf("entry latest-correction"));
+	assert.ok(handoff.indexOf("entry latest-correction") < handoff.indexOf("older checkpoint"));
 	assert.doesNotMatch(handoff, /old completed task|hidden state|stale reminder|assistant-derived state/);
 });
 
@@ -440,6 +442,94 @@ test("history searches normalized text and reports native window ids", async () 
 	assert.match(toolText(secondPage), /needle tail/);
 });
 
+test("history ranks matching original content before recovery and lookup echoes without hiding either", async () => {
+	const { tools, context: base } = setup();
+	const image = { type: "image", data: "UE5HREFUQQ==", mimeType: "image/png" };
+	const branch = [
+		{ type: "message", id: "owner", message: { role: "user", content: "needle original request" } },
+		{ type: "message", id: "assistant", message: { role: "assistant", content: "needle original response" } },
+		{ type: "message", id: "result", message: { role: "toolResult", toolName: "read", content: "needle original output" } },
+		{ type: "context_window", id: "window", handoff: "needle checkpoint" },
+		{ type: "compaction", id: "summary", summary: "needle summary" },
+		{ type: "branch_summary", id: "branch-summary", summary: "needle branch summary" },
+		{ type: "custom_message", id: "reminder", customType: "posthorse-reminder", content: "needle reminder" },
+		{ type: "custom_message", id: "legacy", customType: "headroom-reminder", content: "needle legacy reminder" },
+		{ type: "message", id: "notes", message: { role: "toolResult", toolName: "notes", content: "needle saved note" } },
+		{ type: "message", id: "lookup", message: { role: "toolResult", toolName: "history", content: [{ type: "text", text: "needle recovered output" }, image] } },
+		{ type: "message", id: "rollover", message: { role: "assistant", content: [{ type: "toolCall", name: "new_context", arguments: { handoff: "needle" } }] } },
+		{ type: "message", id: "mixed-call", message: { role: "assistant", content: [
+			{ type: "toolCall", name: "notes", arguments: { op: "write", content: `needle ECHO ${"x".repeat(500)}` } },
+			{ type: "toolCall", name: "bash", arguments: { command: "needle MATCHING SIBLING" } },
+		] } },
+		{ type: "message", id: "mixed-prose", message: { role: "assistant", content: [
+			{ type: "text", text: "needle MATCHING PROSE" },
+			{ type: "text", text: "second line" },
+			{ type: "toolCall", name: "history", arguments: { op: "search", query: `needle ECHO ${"x".repeat(500)}` } },
+		] } },
+		{ type: "message", id: "mixed-echo", message: { role: "assistant", content: [
+			{ type: "toolCall", name: "history", arguments: { op: "search", query: "needle lookup-only" } },
+			{ type: "text", text: "ordinary prose does not match" },
+		] } },
+		{ type: "message", id: "current-search", message: { role: "assistant", content: [{ type: "toolCall", name: "history", arguments: { op: "search", query: "[assistant] needle MATCHING PROSE" } }] } },
+	].map((entry, index, entries) => ({ ...entry, timestamp: `${index}`, parentId: entries[index - 1]?.id ?? null }));
+	const context = { ...base, sessionManager: { getBranch: () => branch, getSessionDir: () => join(tmpdir(), "missing") } };
+	const search = async (query: string, limit = 50) => toolText(await run(tools, "history", { op: "search", query, limit }, context));
+	const ids = (text: string) => [...text.matchAll(/\[window [^\]]+\] \[([^\]]+)\]/g)].map((match) => match[1]);
+	const all = await search("NEEDLE");
+	assert.deepEqual(ids(all), [
+		"mixed-prose", "mixed-call", "result", "assistant", "owner",
+		"current-search", "mixed-echo", "rollover", "lookup", "notes", "legacy", "reminder", "branch-summary", "summary", "window",
+	]);
+	const originals = await search("needle", 5);
+	assert.deepEqual(ids(originals), ids(all).slice(0, 5));
+	assert.match(originals, /MATCHING PROSE/);
+	assert.match(originals, /MATCHING SIBLING/);
+	assert.doesNotMatch(originals, /ECHO/);
+	assert.deepEqual(ids(await search("needle", 1)), ["mixed-prose"]);
+	assert.deepEqual(ids(await search("needle MATCHING PROSE\nsecond line", 1)), ["mixed-prose"]);
+	assert.deepEqual(ids(await search("[assistant] needle MATCHING PROSE", 1)), ["mixed-prose"]);
+	assert.deepEqual(ids(await search("lookup-only")), ["mixed-echo"]);
+	assert.match(all, /\[window window\] \[mixed-call\]/);
+	const read = await run(tools, "history", { op: "read", id: "mixed-call" }, context);
+	assert.match(toolText(read), /needle ECHO/);
+	assert.match(toolText(read), /MATCHING SIBLING/);
+	const recovered = await run(tools, "history", { op: "read", id: "lookup" }, context);
+	assert.match(toolText(recovered), /needle recovered output/);
+	assert.deepEqual(recovered.content.slice(1), [image]);
+});
+
+test("all-session ranking keeps older originals ahead of newer echoes before applying the result limit", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-ranking-test-"));
+	try {
+		const old = { type: "message", id: "old", message: { role: "user", content: "needle oldest original" } };
+		const newer = { type: "message", id: "newer", message: { role: "toolResult", toolName: "bash", content: "needle newer original" } };
+		const echoes = Array.from({ length: 6 }, (_, index) => ({
+			type: "message", id: `echo-${index}`, message: { role: "toolResult", toolName: "history", content: `needle echo-only ${index}` },
+		}));
+		for (const [index, entries] of [[old], [newer, ...echoes], [echoes[5]]].entries()) {
+			const file = join(dir, `${index}.jsonl`);
+			writeFileSync(file, entries.map((entry) => JSON.stringify(entry)).join("\n"));
+			utimesSync(file, new Date((index + 1) * 1000), new Date((index + 1) * 1000));
+		}
+		const { tools, context: base } = setup();
+		const context = { ...base, sessionManager: { getBranch: () => [], getSessionDir: () => dir } };
+		const search = async (query: string, limit: number) => toolText(await run(tools, "history", { op: "search", query, all: true, limit }, context));
+		const ids = (text: string) => [...text.matchAll(/\[window initial\] \[([^\]]+)\]/g)].map((match) => match[1]);
+		assert.deepEqual(ids(await search("needle", 1)), ["newer"]);
+		assert.deepEqual(ids(await search("needle", 2)), ["newer", "old"]);
+		assert.deepEqual(ids(await search("needle", 4)), ["newer", "old", "echo-5", "echo-4"]);
+		const all = await search("needle", 50);
+		assert.deepEqual(ids(all), ["newer", "old", ...echoes.map((entry) => entry.id).reverse()]);
+		assert.match(all, /2\.jsonl[^\n]+\[echo-5\]/, "fork copies use the newest file");
+		assert.deepEqual(ids(await search("echo-only", 2)), ["echo-5", "echo-4"]);
+		const controller = new AbortController();
+		controller.abort();
+		await assert.rejects(tools.get("history")!.execute("id", { op: "search", query: "needle", all: true }, controller.signal, () => {}, context), { name: "AbortError" });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("a persisted legacy headroom-reminder still deduplicates, and a model switch invalidates it", () => {
 	const { handlers, messages, context: base } = setup();
 	const branch: Record<string, unknown>[] = [
@@ -480,6 +570,7 @@ test("automatic handoff carries only the trailing unconsumed tool batch, with en
 	const { handlers, context } = setup();
 	const image = { type: "image", data: "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo=", mimeType: "image/png" };
 	const batch: Record<string, unknown>[] = [
+		{ type: "context_window", id: "older-window", handoff: "FIRST read obsolete-checkpoint.md" },
 		{ type: "message", id: "owner", timestamp: "1", message: { role: "user", content: "run the checks" } },
 		{
 			type: "message",
@@ -510,6 +601,9 @@ test("automatic handoff carries only the trailing unconsumed tool batch, with en
 	assert.match(handoff, /\[result entry result-3\]\n\[1 image: image\/png\] — recover with history read id result-3/);
 	assert.doesNotMatch(handoff, /ASSISTANT PROSE|QUJDREVG/);
 	assert.ok(handoff.indexOf("entry result-1") < handoff.indexOf("entry result-2"), "results keep their order");
+	assert.ok(handoff.indexOf("entry owner") < handoff.indexOf("Unconsumed tool batch"));
+	assert.ok(handoff.indexOf("entry result-3") < handoff.indexOf("older checkpoint"));
+	assert.match(handoff, /FIRST read obsolete-checkpoint\.md/);
 
 	const errored = automaticHandoff(handlers, context, [
 		...batch,
@@ -836,6 +930,29 @@ test("all-session search reports a fork-copied entry once, from the newest-modif
 			["fork.jsonl[fork-new] [", "fork.jsonl[shared] ["],
 		);
 		assert.equal(text.match(/\[shared\]/g)?.length, 1);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("session search and archived reads preserve modification-time ordering including ties", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-posthorse-mtime-test-"));
+	try {
+		for (const [name, mtime] of [["z", 1000], ["m", 2000], ["a", 2000]] as const) {
+			const file = join(dir, `${name}.jsonl`);
+			writeFileSync(file, [
+				{ type: "message", id: "shared", message: { role: "user", content: "shared ancestor" } },
+				{ type: "message", id: name, parentId: "shared", message: { role: "user", content: "mtime needle" } },
+			].map((entry) => JSON.stringify(entry)).join("\n"));
+			utimesSync(file, new Date(mtime), new Date(mtime));
+		}
+		const expected = readdirSync(dir).sort((a, b) => statSync(join(dir, b)).mtimeMs - statSync(join(dir, a)).mtimeMs);
+		const { tools, context: base } = setup();
+		const context = { ...base, sessionManager: { getBranch: () => [], getSessionDir: () => dir } };
+		const search = toolText(await run(tools, "history", { op: "search", query: "mtime needle", all: true }, context));
+		assert.deepEqual(search.split("\n").map((line) => line.split(" ")[0]), expected);
+		const read = toolText(await run(tools, "history", { op: "read", id: "shared" }, context));
+		assert.equal(read.split(" ")[0], expected[0]);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.2
+
+- Shows current-window inputs and unconsumed tool results before the older checkpoint in automatic recovery records.
+- Prioritizes original history matches over recovery notes, handoffs, and previous lookups without removing searchable entries or changing full reads.
+- Reads each session file's modification time once when sorting, instead of repeatedly during comparisons.
+
 ## 0.4.1
 
 Compatibility update for Pi 0.85.0; runtime behavior is unchanged.
