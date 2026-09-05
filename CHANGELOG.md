@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.4
+
+- Skips full-branch lookups outside the checkpoint reminder band and when model input contains no checkpoint reminders.
+
 ## 0.4.3
 
 Documentation correction; runtime behavior is unchanged.

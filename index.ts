@@ -719,6 +719,10 @@ export default function (pi: ExtensionAPI) {
 		if (!usage || usage.tokens == null || usage.contextWindow <= 0) return;
 		const budget = budgetFor(native, usage.contextWindow);
 		if (!budget || !budget.enabled || !budget.supported) return;
+		if (usage.tokens >= budget.rolloverAt) return;
+		const reminderBuffer = Math.min(REMINDER_BUFFER_TOKENS, Math.floor(budget.usable * 0.1));
+		const remindAt = budget.rolloverAt - reminderBuffer;
+		if (usage.tokens < remindAt) return;
 
 		const branch = ctx.sessionManager.getBranch() as EntryLike[];
 		const fingerprint: ReminderFingerprint = {
@@ -726,10 +730,7 @@ export default function (pi: ExtensionAPI) {
 			contextWindow: budget.contextWindow,
 			reserveTokens: budget.reserveTokens,
 		};
-		if (usage.tokens >= budget.rolloverAt) return;
-		const reminderBuffer = Math.min(REMINDER_BUFFER_TOKENS, Math.floor(budget.usable * 0.1));
-		const remindAt = budget.rolloverAt - reminderBuffer;
-		if (usage.tokens < remindAt || hasReminder(branch, fingerprint)) return;
+		if (hasReminder(branch, fingerprint)) return;
 		pi.sendMessage(
 			{
 				customType: REMINDER_TYPE,
@@ -749,6 +750,7 @@ export default function (pi: ExtensionAPI) {
 		const windowId = marker?.role === "custom" ? (marker.details as { windowId?: unknown } | undefined)?.windowId : "initial";
 		if (typeof windowId !== "string") return;
 		const native = nativeContext(ctx);
+		if (!event.messages.some((message) => message.role === "custom" && isReminderType(message.customType))) return;
 		const budget = budgetFor(native);
 		const branch = ctx.sessionManager.getBranch() as EntryLike[];
 		const fingerprint: ReminderFingerprint = {

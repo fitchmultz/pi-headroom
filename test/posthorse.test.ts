@@ -215,10 +215,11 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		let tokens = remindAt - 1;
 		const branch: Record<string, unknown>[] = [{ type: "context_window", id: "window-2" }];
 		const rollovers: Array<{ handoff?: string }> = [];
+		let branchReads = 0;
 		const context: TestContext = {
 			cwd: dir,
 			model: { contextWindow },
-			sessionManager: { getBranch: () => branch, getSessionDir: () => dir },
+			sessionManager: { getBranch: () => { branchReads++; return branch; }, getSessionDir: () => dir },
 			getContextUsage: () => ({ tokens, contextWindow, percent: (tokens / contextWindow) * 100 }),
 			getCompactionSettings: () => ({ enabled: true, reserveTokens: reserve }),
 			getSystemPrompt: () => "You are a test assistant.",
@@ -228,6 +229,7 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		handlers.get("session_start")!({}, context);
 		turnEnd(handlers, context);
 		assert.equal(messages.length, 0, "no reminder below the band");
+		assert.equal(branchReads, 0, "below-band turns must not fetch history");
 		tokens = remindAt;
 		turnEnd(handlers, context, [{ toolName: "new_context" }]);
 		assert.equal(messages.length, 0);
@@ -235,12 +237,14 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		assert.equal(messages.length, 0);
 		handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "aborted" }, toolResults: [] }, context);
 		assert.equal(messages.length, 0);
+		assert.equal(branchReads, 0, "successful rollover batches, errors, and aborts need no history");
 
 		turnEnd(handlers, context);
 		assert.equal(messages.length, 1);
 		assert.match(messages[0].content, /Checkpoint now/);
 		assert.match(messages[0].content, /call new_context now/);
 		assert.deepEqual(messages[0].details, { windowId: "window-2", contextWindow, reserveTokens: reserve });
+		assert.equal(branchReads, 1, "the first token in the reminder band checks the current window");
 		branch.push({ type: "custom_message", customType: "posthorse-reminder", details: messages[0].details });
 
 		tokens = threshold;
@@ -250,14 +254,17 @@ test("budget policy sends one best-effort reminder below the line and lets Pi ow
 		messages.length = 0;
 		turnEnd(handlers, context);
 		assert.equal(messages.length, 1, "Posthorse still offers a checkpoint at equality");
+		assert.equal(branchReads, 3, "in-band turns recheck persisted reminders, including threshold equality");
 
 		messages.length = 0;
 		tokens = rolloverAt;
 		turnEnd(handlers, context);
 		assert.equal(messages.length, 0, "Pi owns the first token that actually triggers rollover");
+		assert.equal(branchReads, 3, "rollover equality must not fetch history");
 		tokens += 1_000;
 		turnEnd(handlers, context);
 		assert.equal(messages.length, 0, "Posthorse also stays out of Pi's over-threshold path");
+		assert.equal(branchReads, 3, "over-threshold turns must not fetch history");
 		assert.equal(rollovers.length, 0);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
@@ -290,6 +297,42 @@ test("disabled Pi compaction disables automatic Posthorse behavior but not new_c
 	assert.match(remaining, /1,000 tokens until the hard context limit/);
 	const result = await run(tools, "new_context", {}, context);
 	assert.deepEqual(result.newContext, { handoff: undefined });
+});
+
+test("reminder-free context skips history without hiding native compatibility errors", () => {
+	const { handlers, context } = setup();
+	const marker = { role: "custom", customType: "context-window", content: "new", details: { windowId: "new" } };
+	const user = { role: "user", content: "posthorse-reminder and headroom-reminder are just text here" };
+	const other = { role: "custom", customType: "intercom_message", content: "keep" };
+	let branchReads = 0;
+	context.sessionManager.getBranch = () => {
+		branchReads++;
+		return [{ type: "custom_message", customType: "headroom-reminder", details: { windowId: "old" } }];
+	};
+	for (const method of ["newContext", "getCompactionSettings", "getSystemPrompt"]) {
+		const incompatible = { ...context };
+		Reflect.deleteProperty(incompatible, method);
+		assert.throws(
+			() => handlers.get("context")!({ messages: [marker, user, other] }, incompatible),
+			/Posthorse requires the fitchmultz\/pi fork/,
+		);
+	}
+	for (const messages of [[], [user, other], [marker, user, other]]) {
+		const original = structuredClone(messages);
+		assert.equal(handlers.get("context")!({ messages }, context), undefined);
+		assert.deepEqual(messages, original, "unrelated messages remain unchanged");
+	}
+	assert.equal(branchReads, 0, "no history is needed even if old reminders remain in the transcript");
+	for (const customType of ["posthorse-reminder", "headroom-reminder"]) {
+		const current = { role: "custom", customType, content: "current", details: { windowId: "new" } };
+		const stale = { ...current, content: "stale", details: { windowId: "old" } };
+		assert.deepEqual(
+			handlers.get("context")!({ messages: [marker, user, other, stale, current] }, context),
+			{ messages: [marker, user, other, current] },
+			`${customType} alone must still trigger stale filtering`,
+		);
+	}
+	assert.equal(branchReads, 2, "both reminder types still consult history when present");
 });
 
 test("context filtering removes reminders from an older window or a different budget, legacy ids included", () => {

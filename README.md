@@ -11,7 +11,7 @@ Pi owns the persisted boundary. Posthorse owns the policy: stable window guidanc
 ## Requirements
 
 - Node `>=22.19.0`.
-- The `fitchmultz/pi` fork. The current tested revision is `f9b06177e565f70cd243a785d088d1c491830dbd` (Pi `0.85.0`). Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
+- The `fitchmultz/pi` fork. The CI baseline is `f9b06177e565f70cd243a785d088d1c491830dbd` (Pi `0.85.0`). Posthorse needs the fork's native `context_window` entries, its `session_before_auto_compact` hook, and `ctx.getCompactionSettings()`.
 - Official, unpatched Pi is unsupported. Posthorse reports a clear extension error at session start and cannot operate; Pi itself keeps running.
 
 ## Install
@@ -53,6 +53,8 @@ Keep exactly one copy loaded. `pi list` shows every package source; if an older 
 5. **Automatic rollover without summaries.** With a supported context budget and room for a recovery record, Posthorse claims Pi's automatic threshold and overflow trigger through `session_before_auto_compact`, before Pi resolves summarization credentials or prepares a summary. Oversized first turns and tool results can then roll over even without summarization credentials. Otherwise Pi's own compaction remains in control. Manual `/compact` is unchanged.
 6. **Bounded recovery record.** The automatic handoff keeps direct user inputs, `ask_question` outcomes, visible coordination messages, and the trailing tool batch that no model has consumed yet (call arguments, bounded result text, and the entry ids to recover the rest). A clearly labeled, possibly stale older checkpoint comes last, after the current inputs and unseen results. Older assistant prose and consumed tool results are not treated as state. Newly submitted input stays separate and is saved after the boundary, not copied into the handoff.
 7. **`notes` and `history`.** Notes live with the repository root, shared across linked worktrees. History searches normalized transcript text and returns stored images for a requested entry.
+
+At turn end, Posthorse checks whether usage is in the reminder band before explicitly looking up the full branch. Context filtering skips its branch lookup when model input contains neither `posthorse-reminder` nor legacy `headroom-reminder` messages. History searches, reads, and recovery remain available with no new limits.
 
 Automatic recovery is an emergency input record, not proof of progress. The fresh model is told to restore notes and todo state, inspect history when needed, and verify live state before taking stateful or external action.
 
@@ -103,4 +105,4 @@ npm run check
 PI_FORK=../pi scripts/integration.sh   # loads the real extension into the fork's test harness (fork built)
 ```
 
-`npm run check` type-checks `index.ts` and the unit tests; the integration test runs inside the fork's harness. CI runs the unit tests on Node 22.19 and 24, `npm audit`, `npm pack --dry-run`, and the integration job against the pinned fork revision.
+`npm run check` type-checks `index.ts` and the unit tests; the integration test runs inside the fork's harness. Unit tests cover reminder boundaries, skipped branch lookups, and legacy reminders; native integration tests cover rollover and history recovery. CI runs the unit tests on Node 22.19 and 24, `npm audit`, `npm pack --dry-run`, and the integration job against the pinned fork revision.
